@@ -128,6 +128,28 @@ public class AuthController : ControllerBase
     }
 
     // ──────────────────────────────────────────────────────────
+    /// <summary>Request an admin password-reset email. Always returns a generic
+    /// success message (anti-enumeration).</summary>
+    [HttpPost("forgot-password")]
+    [EnableRateLimiting("auth")]
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordDto dto)
+    {
+        if (!ModelState.IsValid) return BadRequest(BuildValidationError());
+        var result = await _authService.ForgotPasswordAsync(dto);
+        return Ok(result);   // generic success regardless
+    }
+
+    /// <summary>Complete an admin password reset using the emailed token.</summary>
+    [HttpPost("reset-password")]
+    [EnableRateLimiting("auth")]
+    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordDto dto)
+    {
+        if (!ModelState.IsValid) return BadRequest(BuildValidationError());
+        var result = await _authService.ResetPasswordAsync(dto);
+        return result.StatusCode switch { 200 => Ok(result), _ => BadRequest(result) };
+    }
+
+    // ──────────────────────────────────────────────────────────
     private ApiResponse<object> BuildValidationError() =>
         ApiResponse<object>.Fail(
             "Validation failed.",

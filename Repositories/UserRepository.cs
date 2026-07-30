@@ -24,6 +24,11 @@ public class UserRepository : IUserRepository
                  .AsNoTracking()
                  .FirstOrDefaultAsync(u => u.Username.ToLower() == username.ToLower());
 
+    public async Task<User?> GetByResetTokenHashAsync(string resetTokenHash) =>
+        await _db.Users
+                 .AsNoTracking()
+                 .FirstOrDefaultAsync(u => u.ResetTokenHash == resetTokenHash);
+
     public async Task<bool> EmailExistsAsync(string email) =>
         await _db.Users.AnyAsync(u => u.Email.ToLower() == email.ToLower());
 

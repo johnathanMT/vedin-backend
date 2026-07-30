@@ -28,6 +28,10 @@ public class User
     [Required, MaxLength(20)]
     public string Role { get; set; } = "Guest";
 
+    // ── Password reset (Task 1) — SHA-256 hash of a random token, 15-min expiry ──
+    public string? ResetTokenHash { get; set; }
+    public DateTime? ResetTokenExpiry { get; set; }
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 

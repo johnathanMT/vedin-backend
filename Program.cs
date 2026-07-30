@@ -599,6 +599,15 @@ CREATE TABLE IF NOT EXISTS ConsultationMessages (
             "ALTER TABLE Customers ADD COLUMN Timezone VARCHAR(80) NULL",
             "ALTER TABLE Customers ADD COLUMN IsSuspended TINYINT(1) NOT NULL DEFAULT 0",
             "ALTER TABLE Customers ADD COLUMN ProfileLastUpdated DATETIME(6) NULL",
+            // Password reset (Task 1) + device-binding (Task 2)
+            "ALTER TABLE Customers ADD COLUMN ResetTokenHash VARCHAR(120) NULL",
+            "ALTER TABLE Customers ADD COLUMN ResetTokenExpiry DATETIME(6) NULL",
+            "ALTER TABLE Customers ADD COLUMN DeviceBindingHash VARCHAR(120) NULL",
+            "ALTER TABLE Customers ADD COLUMN DeviceBindingExpiry DATETIME(6) NULL",
+            // Admin (Users) password reset (Task 1) — Users is EF-migrated; add the
+            // columns idempotently so the new User.ResetToken* properties map cleanly.
+            "ALTER TABLE Users ADD COLUMN ResetTokenHash VARCHAR(120) NULL",
+            "ALTER TABLE Users ADD COLUMN ResetTokenExpiry DATETIME(6) NULL",
         })
         {
             try { await db.Database.ExecuteSqlRawAsync(alter); } catch { /* column already present */ }

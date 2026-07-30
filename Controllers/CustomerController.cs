@@ -1,5 +1,6 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -71,13 +72,16 @@ public class CustomerController : ControllerBase
             if (cust is not null && !cust.EmailConfirmed)
             {
                 string token = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");   // 64 hex chars
+                string deviceSecret = NewSecret();
                 cust.VerifyToken = token;                                                       // invalidates the old one
                 cust.VerifyExpiry = DateTime.UtcNow.AddHours(48);
+                cust.DeviceBindingHash = Sha256(deviceSecret);                                  // re-bind to THIS browser
+                cust.DeviceBindingExpiry = DateTime.UtcNow.AddHours(48);
                 cust.UpdatedAt = DateTime.UtcNow;
                 await _db.SaveChangesAsync();
+                SetDeviceCookie(deviceSecret);
 
-                string apiBase = (_cfg["App:ApiBase"] ?? "https://myweb-zqv1.onrender.com").TrimEnd('/');
-                await _email.SendAsync(email, "Vedin — သင့်အကောင့်ကို အတည်ပြုပါ", VerifyEmailHtml($"{apiBase}/api/customer/verify-email?token={token}"));
+                await _email.SendAsync(email, "Vedin — သင့်အကောင့်ကို အတည်ပြုပါ", VerifyEmailHtml($"{FrontendUrl()}/confirm?token={token}"));
             }
             // Apply throttle counters whether or not the account exists (constant behaviour).
             _cache.Set($"rc:cool:e:{email}", true, TimeSpan.FromSeconds(60));
@@ -103,6 +107,7 @@ public class CustomerController : ControllerBase
             return Conflict(ApiResponse<object>.Fail("This email is already registered.", 409));
 
         string token = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
+        string deviceSecret = NewSecret();
         string? Enc(string? v) => string.IsNullOrWhiteSpace(v) ? null : FieldCrypto.Encrypt(v.Trim(), _encKey);
         var cust = new Customer
         {
@@ -113,6 +118,11 @@ public class CustomerController : ControllerBase
             EmailConfirmed = false,
             VerifyToken = token,
             VerifyExpiry = DateTime.UtcNow.AddHours(48),
+            // Device-binding (Task 2): random secret, stored hashed. The raw value is
+            // set in an HttpOnly cookie below so email confirmation can only auto-login
+            // on the SAME browser that signed up.
+            DeviceBindingHash = Sha256(deviceSecret),
+            DeviceBindingExpiry = DateTime.UtcNow.AddHours(48),
             // Natal profile (PII fields encrypted at rest).
             Gender = string.IsNullOrWhiteSpace(dto.Gender) ? null : dto.Gender.Trim(),
             Dob = Enc(dto.Dob),
@@ -127,8 +137,12 @@ public class CustomerController : ControllerBase
         _db.Customers.Add(cust);
         await _db.SaveChangesAsync();
 
-        string apiBase = (_cfg["App:ApiBase"] ?? "https://myweb-zqv1.onrender.com").TrimEnd('/');
-        string link = $"{apiBase}/api/customer/verify-email?token={token}";
+        // Bind this browser to the pending confirmation (HttpOnly, cross-subdomain).
+        SetDeviceCookie(deviceSecret);
+
+        // The link points to the FRONTEND /confirm route (not the API), so the browser
+        // sends the device-binding cookie to POST /confirm-email and can auto-login.
+        string link = $"{FrontendUrl()}/confirm?token={token}";
 
         // Sending is the step that fails when SMTP is misconfigured. Wrap it so a
         // provider exception surfaces as a clear 400 instead of a raw 500. The
@@ -176,6 +190,125 @@ public class CustomerController : ControllerBase
         // instructing the user to return to their original device and log in there.
         return HtmlPage(VerifySuccessHtml());
     }
+
+    // ── Confirm email via the frontend /confirm route (Task 2) ──────────────────
+    // The frontend POSTs the token here WITH the device-binding cookie (credentials:
+    // include). We confirm the email either way, but only auto-login (return a JWT)
+    // when the cookie proves this is the SAME browser that signed up.
+    [HttpPost("confirm-email")]
+    [EnableRateLimiting("general")]
+    public async Task<IActionResult> ConfirmEmail([FromBody] ConfirmEmailDto dto)
+    {
+        var token = (dto.Token ?? string.Empty).Trim();
+        var cust = string.IsNullOrWhiteSpace(token) ? null
+            : await _db.Customers.FirstOrDefaultAsync(c => c.VerifyToken == token);
+        if (cust is null || cust.VerifyExpiry is null || cust.VerifyExpiry < DateTime.UtcNow)
+            return BadRequest(ApiResponse<object>.Fail("This confirmation link is invalid or has expired.", 400));
+
+        // Same-device check BEFORE we clear the binding.
+        var cookie = Request.Cookies["vedin_devbind"];
+        bool sameDevice = !string.IsNullOrWhiteSpace(cookie)
+            && !string.IsNullOrWhiteSpace(cust.DeviceBindingHash)
+            && cust.DeviceBindingExpiry is not null && cust.DeviceBindingExpiry >= DateTime.UtcNow
+            && CryptographicOperations.FixedTimeEquals(
+                 Encoding.UTF8.GetBytes(Sha256(cookie)),
+                 Encoding.UTF8.GetBytes(cust.DeviceBindingHash));
+
+        // Email ownership is proven by the token → confirm regardless of device.
+        cust.EmailConfirmed = true;
+        cust.VerifyToken = null;
+        cust.VerifyExpiry = null;
+        cust.DeviceBindingHash = null;      // one-time use
+        cust.DeviceBindingExpiry = null;
+        cust.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        ClearDeviceCookie();
+
+        if (sameDevice)
+        {
+            var jwt = GenerateJwt(cust);
+            return Ok(ApiResponse<object>.Ok(
+                new { confirmed = true, sameDevice = true, token = jwt, username = cust.Username, email = cust.Email },
+                "Email confirmed — you are now signed in."));
+        }
+        return Ok(ApiResponse<object>.Ok(
+            new { confirmed = true, sameDevice = false },
+            "Email confirmed. For your security, please return to your original device and sign in."));
+    }
+
+    // ── Forgot password (Task 1) — always a generic success (anti-enumeration) ──
+    [HttpPost("forgot-password")]
+    [EnableRateLimiting("auth")]
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordDto dto)
+    {
+        const string generic = "If an account exists for that email, a password-reset link has been sent.";
+        var email = (dto.Email ?? string.Empty).ToLowerInvariant().Trim();
+        if (email.Length is > 3 and < 200 && email.Contains('@'))
+        {
+            var cust = await _db.Customers.FirstOrDefaultAsync(c => c.Email == email);
+            if (cust is not null && !cust.IsSuspended)
+            {
+                var raw = NewSecret();
+                cust.ResetTokenHash = Sha256(raw);
+                cust.ResetTokenExpiry = DateTime.UtcNow.AddMinutes(15);   // short-lived
+                cust.UpdatedAt = DateTime.UtcNow;
+                await _db.SaveChangesAsync();
+                try { await _email.SendAsync(email, "Vedin — စကားဝှက် ပြန်လည်သတ်မှတ်ရန်", ResetEmailHtml($"{FrontendUrl()}/reset-password?token={raw}")); }
+                catch (Exception ex) { _log.LogError(ex, "Reset email failed to send for {Email}.", email); }
+            }
+        }
+        return Ok(ApiResponse<object>.Ok(new { }, generic));
+    }
+
+    // ── Reset password (Task 1) — verify the token, set a new BCrypt hash ───────
+    [HttpPost("reset-password")]
+    [EnableRateLimiting("auth")]
+    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordDto dto)
+    {
+        if (!ModelState.IsValid) return BadRequest(ApiResponse<object>.Fail("Validation failed.", 400));
+        if (dto.NewPassword != dto.ConfirmPassword)
+            return BadRequest(ApiResponse<object>.Fail("Passwords do not match.", 400));
+
+        var hash = Sha256(dto.Token.Trim());
+        var cust = await _db.Customers.FirstOrDefaultAsync(c => c.ResetTokenHash == hash);
+        if (cust is null || cust.ResetTokenExpiry is null || cust.ResetTokenExpiry < DateTime.UtcNow)
+            return BadRequest(ApiResponse<object>.Fail("This reset link is invalid or has expired. Please request a new one.", 400));
+
+        cust.PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword, workFactor: 12);
+        cust.ResetTokenHash = null;
+        cust.ResetTokenExpiry = null;
+        cust.EmailConfirmed = true;   // resetting via the emailed link also proves ownership
+        cust.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        return Ok(ApiResponse<object>.Ok(new { }, "Your password has been reset. You can now sign in."));
+    }
+
+    // ── Crypto + cookie helpers ─────────────────────────────────────────────────
+    /// <summary>64-hex-char cryptographically-secure random token (raw value).</summary>
+    private static string NewSecret() => Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+    /// <summary>SHA-256 (hex) of a value — what we STORE for reset/device tokens.</summary>
+    private static string Sha256(string s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
+    private string FrontendUrl() => (_cfg["Frontend:Url"] ?? "https://vedin.myothant.dev").TrimEnd('/');
+
+    private CookieOptions DeviceCookieOptions(DateTimeOffset expires)
+    {
+        var opts = new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.None,   // cross-subdomain fetch (api. → vedin.) with credentials
+            Path = "/",
+            IsEssential = true,
+            Expires = expires,
+        };
+        var domain = _cfg["Cookie:Domain"];   // e.g. ".myothant.dev" in prod (unset on localhost)
+        if (!string.IsNullOrWhiteSpace(domain)) opts.Domain = domain;
+        return opts;
+    }
+    private void SetDeviceCookie(string value) =>
+        Response.Cookies.Append("vedin_devbind", value, DeviceCookieOptions(DateTimeOffset.UtcNow.AddHours(48)));
+    private void ClearDeviceCookie() =>
+        Response.Cookies.Append("vedin_devbind", string.Empty, DeviceCookieOptions(DateTimeOffset.UtcNow.AddDays(-1)));
 
     /// <summary>Always emit explicit UTF-8 text/html so the browser renders the page
     /// instead of downloading it.</summary>
@@ -660,6 +793,25 @@ public class CustomerController : ControllerBase
       <p style="margin:0 0 22px;color:#b9b09b;font-size:14px;line-height:1.9">Vedin အကောင့် ဖန်တီးသည့်အတွက် ကျေးဇူးတင်ပါသည်။ အောက်ပါခလုတ်ကို နှိပ်၍ သင့်အီးမေးလ်ကို အတည်ပြုပါ။ ထို့နောက် အကောင့်ဝင်၍ ဗေဒင်ဟောစာတမ်းများ ရယူနိုင်ပါသည်။</p>
       <a href="{{LINK}}" style="display:inline-block;background:linear-gradient(135deg,#a855f7,#eab308);color:#14110d;font-weight:700;text-decoration:none;padding:14px 26px;border-radius:12px;font-size:15px">Confirm my email</a>
       <p style="margin:22px 0 0;color:#726a5c;font-size:12px;line-height:1.8">This link expires in 48 hours. If you didn't create a Vedin account, you can ignore this email.</p>
+    </div>
+    <p style="text-align:center;color:#4a443b;font-size:11px;margin-top:16px">Vedin &middot; myothant.dev</p>
+  </div>
+</body></html>
+""";
+        return tpl.Replace("{{LINK}}", link);
+    }
+
+    private string ResetEmailHtml(string link)
+    {
+        const string tpl = """
+<!doctype html><html><body style="margin:0;background:#0b0a14;font-family:Segoe UI,Helvetica,Arial,sans-serif">
+  <div style="max-width:560px;margin:0 auto;padding:32px 20px">
+    <div style="background:linear-gradient(135deg,#14121f,#1b1830);border:1px solid rgba(168,85,247,.35);border-radius:18px;padding:34px 28px;box-shadow:0 0 60px -20px rgba(168,85,247,.5)">
+      <div style="font:600 12px 'Segoe UI';letter-spacing:.3em;text-transform:uppercase;color:#eab308;margin-bottom:14px">Vedin &middot; Vedic Astrology</div>
+      <h1 style="margin:0 0 8px;font-size:22px;color:#f2ede0">Reset your password</h1>
+      <p style="margin:0 0 22px;color:#b9b09b;font-size:14px;line-height:1.9">သင့် Vedin အကောင့်၏ စကားဝှက်ကို ပြန်လည်သတ်မှတ်ရန် တောင်းဆိုထားပါသည်။ အောက်ပါခလုတ်ကို နှိပ်၍ စကားဝှက်အသစ် သတ်မှတ်ပါ။</p>
+      <a href="{{LINK}}" style="display:inline-block;background:linear-gradient(135deg,#a855f7,#eab308);color:#14110d;font-weight:700;text-decoration:none;padding:14px 26px;border-radius:12px;font-size:15px">Reset my password</a>
+      <p style="margin:22px 0 0;color:#726a5c;font-size:12px;line-height:1.8">This link expires in 15 minutes. If you didn't request a password reset, you can safely ignore this email — your password will not change.</p>
     </div>
     <p style="text-align:center;color:#4a443b;font-size:11px;margin-top:16px">Vedin &middot; myothant.dev</p>
   </div>

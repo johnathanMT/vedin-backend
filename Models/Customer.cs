@@ -13,6 +13,16 @@ public class Customer
     public string? VerifyToken { get; set; }
     public DateTime? VerifyExpiry { get; set; }
 
+    // ── Password reset (Task 1) — SHA-256 hash of a random token, 15-min expiry ──
+    public string? ResetTokenHash { get; set; }
+    public DateTime? ResetTokenExpiry { get; set; }
+
+    // ── Device-binding (Task 2) — SHA-256 hash of the value set in the HttpOnly
+    //    `vedin_devbind` cookie at signup, so email confirmation + auto-login can
+    //    only complete on the SAME browser that signed up. ──────────────────────
+    public string? DeviceBindingHash { get; set; }
+    public DateTime? DeviceBindingExpiry { get; set; }
+
     // ── Natal profile (the account owner's own birth chart) ─────────────────────
     // DOB / BirthTime / LocationName carry birth PII → AES-GCM encrypted at rest.
     // Latitude / Longitude / Timezone are needed for computation and kept plain.

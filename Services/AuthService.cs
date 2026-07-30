@@ -1,5 +1,6 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.IdentityModel.Tokens;
 using PortfolioApi.Common;
@@ -14,15 +15,18 @@ public class AuthService : IAuthService
     private readonly IUserRepository _userRepo;
     private readonly IConfiguration  _config;
     private readonly ILogger<AuthService> _logger;
+    private readonly IEmailService _email;
 
     public AuthService(
         IUserRepository   userRepo,
         IConfiguration    config,
-        ILogger<AuthService> logger)
+        ILogger<AuthService> logger,
+        IEmailService     email)
     {
         _userRepo = userRepo;
         _config   = config;
         _logger   = logger;
+        _email    = email;
     }
 
     // ──────────────────────────────────────────────────────────
@@ -107,6 +111,66 @@ public class AuthService : IAuthService
         _logger.LogInformation("Password changed for {Email}", user.Email);
         return ApiResponse.OkNoData("Password updated successfully.");
     }
+
+    // ──────────────────────────────────────────────────────────
+    /// <summary>Admin forgot-password. ALWAYS returns a generic success (anti-enum);
+    /// only actually emails a 15-minute reset link when the email maps to a user.</summary>
+    public async Task<ApiResponse> ForgotPasswordAsync(ForgotPasswordDto dto)
+    {
+        var email = (dto.Email ?? string.Empty).ToLower().Trim();
+        if (email.Length is > 3 and < 200 && email.Contains('@'))
+        {
+            var user = await _userRepo.GetByEmailAsync(email);
+            if (user is not null)
+            {
+                var raw = NewSecret();
+                user.ResetTokenHash = Sha256(raw);
+                user.ResetTokenExpiry = DateTime.UtcNow.AddMinutes(15);
+                await _userRepo.UpdateAsync(user);
+                var link = $"{FrontendUrl()}/reset-password?scope=admin&token={raw}";
+                try { await _email.SendAsync(email, "Vedin Admin — Password reset", ResetEmailHtml(link)); }
+                catch (System.Exception ex) { _logger.LogError(ex, "Admin reset email failed for {Email}", email); }
+            }
+        }
+        return ApiResponse.OkNoData("If an account exists for that email, a password-reset link has been sent.");
+    }
+
+    /// <summary>Admin reset-password. Verifies the (hashed) token + 15-min expiry,
+    /// then stores a new BCrypt hash and invalidates the token.</summary>
+    public async Task<ApiResponse> ResetPasswordAsync(ResetPasswordDto dto)
+    {
+        if (dto.NewPassword != dto.ConfirmPassword)
+            return ApiResponse.Fail("Passwords do not match.", 400);
+
+        var user = await _userRepo.GetByResetTokenHashAsync(Sha256(dto.Token.Trim()));
+        if (user is null || user.ResetTokenExpiry is null || user.ResetTokenExpiry < DateTime.UtcNow)
+            return ApiResponse.Fail("This reset link is invalid or has expired. Please request a new one.", 400);
+
+        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword, workFactor: 12);
+        user.ResetTokenHash = null;
+        user.ResetTokenExpiry = null;
+        await _userRepo.UpdateAsync(user);
+        _logger.LogInformation("Admin password reset for {Email}", user.Email);
+        return ApiResponse.OkNoData("Your password has been reset. You can now sign in.");
+    }
+
+    private static string NewSecret() => System.Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+    private static string Sha256(string s) => System.Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
+    private string FrontendUrl() => (_config["Frontend:Url"] ?? "https://vedin.myothant.dev").TrimEnd('/');
+    private static string ResetEmailHtml(string link) =>
+        """
+<!doctype html><html><body style="margin:0;background:#0b0a14;font-family:Segoe UI,Arial,sans-serif">
+  <div style="max-width:560px;margin:0 auto;padding:32px 20px">
+    <div style="background:linear-gradient(135deg,#14121f,#1b1830);border:1px solid rgba(168,85,247,.35);border-radius:18px;padding:34px 28px">
+      <div style="font:600 12px 'Segoe UI';letter-spacing:.3em;text-transform:uppercase;color:#eab308;margin-bottom:14px">Vedin &middot; Admin</div>
+      <h1 style="margin:0 0 8px;font-size:22px;color:#f2ede0">Reset your admin password</h1>
+      <p style="margin:0 0 22px;color:#b9b09b;font-size:14px;line-height:1.8">A password reset was requested for your Vedin admin account. Click below to set a new password.</p>
+      <a href="{{link}}" style="display:inline-block;background:linear-gradient(135deg,#a855f7,#eab308);color:#14110d;font-weight:700;text-decoration:none;padding:14px 26px;border-radius:12px;font-size:15px">Reset password</a>
+      <p style="margin:22px 0 0;color:#726a5c;font-size:12px;line-height:1.8">This link expires in 15 minutes. If you didn't request this, ignore this email.</p>
+    </div>
+  </div>
+</body></html>
+""".Replace("{{link}}", link);
 
     // ──────────────────────────────────────────────────────────
     private string GenerateJwtToken(User user)
