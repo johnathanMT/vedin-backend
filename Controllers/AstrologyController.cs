@@ -46,6 +46,18 @@ public class AstrologyController : ControllerBase
         _encKey = cfg["Astrology:EncryptionKey"] ?? cfg["Jwt:Key"] ?? "astrology-fallback-key-set-in-env";
     }
 
+    /// <summary>Admin-only diagnostic: verify the AI provider key + model WITHOUT
+    /// generating a reading. Calls the provider's ListModels endpoint and reports
+    /// whether the key is valid and the configured model is available.</summary>
+    /// <remarks>GET /api/astrology/ai-health</remarks>
+    [HttpGet("ai-health")]
+    [Authorize(Policy = "AdminOnly")]
+    public async Task<IActionResult> AiHealth(CancellationToken ct)
+    {
+        var result = await _ai.CheckHealthAsync(ct);
+        return StatusCode(result.StatusCode, result);
+    }
+
     /// <summary>Compute a sidereal Rasi (D1) chart.</summary>
     /// <remarks>
     ///     POST /api/astrology/chart

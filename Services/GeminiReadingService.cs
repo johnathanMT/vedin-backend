@@ -103,14 +103,33 @@ querent that the computation is precise but the reading is guidance for reflecti
 
     public async Task<ApiResponse<AiReadingResponseDto>> GenerateAsync(AiReadingRequestDto req, CancellationToken ct = default)
     {
-        var apiKey = _cfg["AI:GeminiApiKey"];
-        if (string.IsNullOrWhiteSpace(apiKey)) apiKey = _cfg["AI:OpenAiApiKey"]; // back-compat secret name
-        if (string.IsNullOrWhiteSpace(apiKey))
+        // Resolve the key + remember WHERE it came from (surfaced in logs on failure).
+        var rawKey = _cfg["AI:GeminiApiKey"];
+        var keySource = "AI__GeminiApiKey";
+        if (string.IsNullOrWhiteSpace(rawKey))
         {
-            _log.LogWarning("AI reading requested but AI:GeminiApiKey is not configured.");
+            rawKey = _cfg["AI:OpenAiApiKey"];               // back-compat secret name
+            keySource = "AI__OpenAiApiKey (fallback)";
+        }
+        if (string.IsNullOrWhiteSpace(rawKey))
+        {
+            _log.LogWarning("AI reading requested but neither AI__GeminiApiKey nor AI__OpenAiApiKey is configured on this service.");
             return ApiResponse<AiReadingResponseDto>.Fail(
                 "AI reading is not configured on the server yet.", 503);
         }
+
+        // Trim surrounding whitespace/newlines — the #1 cause of a spurious 401/403 is a
+        // stray "\n" pasted into the Render env editor, which corrupts the header value.
+        var apiKey = rawKey.Trim();
+        if (apiKey.Length != rawKey.Length)
+            _log.LogWarning("Gemini API key from {Source} had surrounding whitespace/newline — trimmed. Re-check the Render env var for a trailing newline.", keySource);
+
+        // A Google AI Studio key starts with "AIza". An OpenAI key ("sk-…") passed to
+        // Google is rejected with 401/403 — catch that misconfiguration explicitly.
+        if (apiKey.StartsWith("sk-", StringComparison.OrdinalIgnoreCase))
+            _log.LogError("The key from {Source} looks like an OpenAI key (sk-…), NOT a Google AI key (AIza…). Google will reject it. Set AI__GeminiApiKey to a Google AI Studio key.", keySource);
+        else if (!apiKey.StartsWith("AIza", StringComparison.Ordinal))
+            _log.LogWarning("The key from {Source} does not start with the expected Google prefix 'AIza' — verify it is a Google AI Studio key.", keySource);
 
         // Default to a GA model. Retired ids (gemini-1.5-*, gemini-2.0-*, and
         // gemini-2.5-pro for new accounts) return 404 from generateContent.
@@ -152,13 +171,23 @@ querent that the computation is precise but the reading is guidance for reflecti
 
             if (!resp.IsSuccessStatusCode)
             {
-                _log.LogWarning("Gemini returned {Status}: {Body}", (int)resp.StatusCode, Truncate(body, 600));
-                var friendly = (int)resp.StatusCode switch
+                var status = (int)resp.StatusCode;
+                // Mask the key (first 6 + length) so the exact reason is diagnosable on
+                // Render WITHOUT leaking the secret. Google's body carries the precise
+                // reason, e.g. "API_KEY_INVALID" / "API key not valid" /
+                // "PERMISSION_DENIED: Generative Language API has not been used…".
+                var masked = apiKey.Length <= 8 ? "******" : $"{apiKey[..6]}…(len {apiKey.Length})";
+                _log.LogError(
+                    "Gemini call FAILED {Status}. key={Source}={Masked}, model={Model}, url={Url}. Provider response: {Body}",
+                    status, keySource, masked, model, url, Truncate(body, 1000));
+
+                var friendly = status switch
                 {
-                    400 => "AI provider rejected the request (check the model name / API key).",
-                    401 or 403 => "AI provider rejected the API key.",
+                    400 => "AI provider rejected the request (check the model name / API key format).",
+                    401 or 403 => "AI provider rejected the API key. See the server log for Google's exact reason (invalid key, restricted key, or the Generative Language API not enabled for this project).",
+                    404 => $"AI model '{model}' was not found for this API key. Set AI__Model to a model your key can access.",
                     429 => "AI provider is rate-limiting requests. Please try again shortly.",
-                    _ => $"AI provider error ({(int)resp.StatusCode}).",
+                    _ => $"AI provider error ({status}).",
                 };
                 return ApiResponse<AiReadingResponseDto>.Fail(friendly, 502);
             }
@@ -194,6 +223,67 @@ querent that the computation is precise but the reading is guidance for reflecti
         {
             _log.LogError(ex, "AI reading generation failed.");
             return ApiResponse<AiReadingResponseDto>.Fail("Could not reach the AI provider. Please try again later.", 502);
+        }
+    }
+
+    /// <summary>Verify the key + model against Google WITHOUT generating a reading —
+    /// calls the lightweight ListModels endpoint and checks the configured model.</summary>
+    public async Task<ApiResponse<object>> CheckHealthAsync(CancellationToken ct = default)
+    {
+        var rawKey = _cfg["AI:GeminiApiKey"];
+        var keySource = "AI__GeminiApiKey";
+        if (string.IsNullOrWhiteSpace(rawKey)) { rawKey = _cfg["AI:OpenAiApiKey"]; keySource = "AI__OpenAiApiKey (fallback)"; }
+        if (string.IsNullOrWhiteSpace(rawKey))
+            return ApiResponse<object>.Fail("No AI key configured — set AI__GeminiApiKey on this service.", 503);
+
+        var apiKey = rawKey.Trim();
+        var model = string.IsNullOrWhiteSpace(_cfg["AI:Model"]) ? "gemini-3.6-flash" : _cfg["AI:Model"]!;
+        var baseUrl = (string.IsNullOrWhiteSpace(_cfg["AI:BaseUrl"])
+            ? "https://generativelanguage.googleapis.com/v1beta"
+            : _cfg["AI:BaseUrl"]!).TrimEnd('/');
+        var masked = apiKey.Length <= 8 ? "******" : $"{apiKey[..6]}…(len {apiKey.Length})";
+
+        try
+        {
+            using var msg = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/models?pageSize=200");
+            msg.Headers.TryAddWithoutValidation("x-goog-api-key", apiKey);
+            using var resp = await _http.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _log.LogError("ai-health: Gemini ListModels {Status}. key={Source}={Masked}. Provider response: {Body}",
+                    (int)resp.StatusCode, keySource, masked, Truncate(body, 600));
+                return ApiResponse<object>.Ok(new
+                {
+                    ok = false, provider = "gemini", keySource, keyMasked = masked, model,
+                    status = (int)resp.StatusCode,
+                    reason = Truncate(body, 500),
+                }, "AI key check FAILED — see reason.");
+            }
+
+            var names = new List<string>();
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("models", out var arr))
+                foreach (var m in arr.EnumerateArray())
+                    if (m.TryGetProperty("name", out var n))
+                        names.Add((n.GetString() ?? string.Empty).Replace("models/", string.Empty));
+
+            var modelOk = names.Any(x => x.Equals(model, StringComparison.OrdinalIgnoreCase));
+            return ApiResponse<object>.Ok(new
+            {
+                ok = true, provider = "gemini", keySource, keyMasked = masked,
+                model, modelAvailable = modelOk,
+                usableModels = names.Where(x => x.Contains("flash") || x.Contains("pro")).OrderBy(x => x).Take(25).ToArray(),
+                message = modelOk
+                    ? "Key valid and the configured model is available."
+                    : $"Key VALID, but model '{model}' is NOT in this account's list — set AI__Model to one of usableModels.",
+            }, "OK");
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "ai-health: Gemini check threw.");
+            return ApiResponse<object>.Fail($"AI health check error: {ex.Message}", 502);
         }
     }
 

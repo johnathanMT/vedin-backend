@@ -71,13 +71,19 @@ for reflection, computed precisely but interpreted with care.
 
     public async Task<ApiResponse<AiReadingResponseDto>> GenerateAsync(AiReadingRequestDto req, CancellationToken ct = default)
     {
-        var apiKey = _cfg["AI:OpenAiApiKey"];
-        if (string.IsNullOrWhiteSpace(apiKey))
+        var rawKey = _cfg["AI:OpenAiApiKey"];
+        if (string.IsNullOrWhiteSpace(rawKey))
         {
-            _log.LogWarning("AI reading requested but AI:OpenAiApiKey is not configured.");
+            _log.LogWarning("AI reading requested but AI__OpenAiApiKey is not configured on this service.");
             return ApiResponse<AiReadingResponseDto>.Fail(
                 "AI reading is not configured on the server yet.", 503);
         }
+        // Trim stray whitespace/newlines from the pasted env var (a common 401 cause).
+        var apiKey = rawKey.Trim();
+        if (apiKey.Length != rawKey.Length)
+            _log.LogWarning("AI__OpenAiApiKey had surrounding whitespace/newline — trimmed. Re-check the Render env var.");
+        if (!apiKey.StartsWith("sk-", StringComparison.OrdinalIgnoreCase))
+            _log.LogWarning("AI__OpenAiApiKey does not start with the expected 'sk-' prefix — verify it is an OpenAI key.");
 
         var model = string.IsNullOrWhiteSpace(_cfg["AI:Model"]) ? "gpt-4o-mini" : _cfg["AI:Model"]!;
         var baseUrl = (string.IsNullOrWhiteSpace(_cfg["AI:BaseUrl"]) ? "https://api.openai.com/v1" : _cfg["AI:BaseUrl"]!).TrimEnd('/');
@@ -109,12 +115,17 @@ for reflection, computed precisely but interpreted with care.
 
             if (!resp.IsSuccessStatusCode)
             {
-                _log.LogWarning("AI provider returned {Status}: {Body}", (int)resp.StatusCode, Truncate(body, 600));
-                var friendly = (int)resp.StatusCode switch
+                var status = (int)resp.StatusCode;
+                var masked = apiKey.Length <= 8 ? "******" : $"{apiKey[..6]}…(len {apiKey.Length})";
+                _log.LogError(
+                    "OpenAI call FAILED {Status}. key=AI__OpenAiApiKey={Masked}, model={Model}, url={Url}. Provider response: {Body}",
+                    status, masked, model, url, Truncate(body, 1000));
+                var friendly = status switch
                 {
-                    401 => "AI provider rejected the API key.",
+                    401 => "AI provider rejected the API key. See the server log for the provider's exact reason.",
+                    404 => $"AI model '{model}' was not found for this API key. Set AI__Model to a model your key can access.",
                     429 => "AI provider is rate-limiting requests. Please try again shortly.",
-                    _ => $"AI provider error ({(int)resp.StatusCode}).",
+                    _ => $"AI provider error ({status}).",
                 };
                 return ApiResponse<AiReadingResponseDto>.Fail(friendly, 502);
             }
@@ -144,6 +155,50 @@ for reflection, computed precisely but interpreted with care.
         {
             _log.LogError(ex, "AI reading generation failed.");
             return ApiResponse<AiReadingResponseDto>.Fail("Could not reach the AI provider. Please try again later.", 502);
+        }
+    }
+
+    /// <summary>Verify the key against the provider WITHOUT generating a reading —
+    /// calls the OpenAI-compatible /models endpoint.</summary>
+    public async Task<ApiResponse<object>> CheckHealthAsync(CancellationToken ct = default)
+    {
+        var rawKey = _cfg["AI:OpenAiApiKey"];
+        if (string.IsNullOrWhiteSpace(rawKey))
+            return ApiResponse<object>.Fail("No AI key configured — set AI__OpenAiApiKey on this service.", 503);
+
+        var apiKey = rawKey.Trim();
+        var baseUrl = (string.IsNullOrWhiteSpace(_cfg["AI:BaseUrl"]) ? "https://api.openai.com/v1" : _cfg["AI:BaseUrl"]!).TrimEnd('/');
+        var model = string.IsNullOrWhiteSpace(_cfg["AI:Model"]) ? "gpt-4o-mini" : _cfg["AI:Model"]!;
+        var masked = apiKey.Length <= 8 ? "******" : $"{apiKey[..6]}…(len {apiKey.Length})";
+
+        try
+        {
+            using var msg = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/models");
+            msg.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+            using var resp = await _http.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _log.LogError("ai-health: OpenAI /models {Status}={Masked}. Provider response: {Body}",
+                    (int)resp.StatusCode, masked, Truncate(body, 600));
+                return ApiResponse<object>.Ok(new
+                {
+                    ok = false, provider = "openai", keyMasked = masked, model,
+                    status = (int)resp.StatusCode, reason = Truncate(body, 500),
+                }, "AI key check FAILED — see reason.");
+            }
+
+            return ApiResponse<object>.Ok(new
+            {
+                ok = true, provider = "openai", keyMasked = masked, model,
+                message = "Key valid.",
+            }, "OK");
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "ai-health: OpenAI check threw.");
+            return ApiResponse<object>.Fail($"AI health check error: {ex.Message}", 502);
         }
     }
 
