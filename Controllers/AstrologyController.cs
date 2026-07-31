@@ -375,7 +375,7 @@ public class AstrologyController : ControllerBase
         string birth = FieldCrypto.Decrypt(row.BirthInfo, _encKey);
         var pdf = MiniPdf.Build("Vedin - Vedic Astrology Reading", new[]
         {
-            "Sayar Myo Thant Naing - Professional Vedic Astrology",
+            "Sayar Bhone Min Thike Din - Professional Vedic Astrology",
             "",
             string.IsNullOrWhiteSpace(name) ? "Reading for: (querent)" : $"Reading for: {name}",
             string.IsNullOrWhiteSpace(birth) ? "" : $"Birth: {birth}",
@@ -402,7 +402,7 @@ public class AstrologyController : ControllerBase
   <div style="max-width:560px;margin:0 auto;padding:32px 20px">
     <div style="background:linear-gradient(135deg,#14121f,#1b1830);border:1px solid rgba(168,85,247,.35);border-radius:18px;padding:34px 28px;box-shadow:0 0 60px -20px rgba(168,85,247,.5)">
       <div style="font:600 12px 'Segoe UI';letter-spacing:.3em;text-transform:uppercase;color:#eab308;margin-bottom:14px">Vedin &middot; Vedic Astrology</div>
-      <h1 style="margin:0 0 8px;font-size:22px;color:#f2ede0">Sayar Myo Thant Naing</h1>
+      <h1 style="margin:0 0 8px;font-size:22px;color:#f2ede0">Sayar Bhone Min Thike Din</h1>
       <p style="margin:0 0 22px;color:#b9b09b;font-size:14px;line-height:1.9">ဂုဏ်ယူပါသည်။ သင်၏ ဗေဒင်ဟောစာတမ်း (PDF) ကို Admin မှ အတည်ပြုပေးလိုက်ပါပြီ။ အောက်ပါလင့်ခ်မှတစ်ဆင့် လုံခြုံစွာ ရယူနိုင်ပါသည်။</p>
       <a href="{{LINK}}" style="display:inline-block;background:linear-gradient(135deg,#a855f7,#eab308);color:#14110d;font-weight:700;text-decoration:none;padding:14px 26px;border-radius:12px;font-size:15px">Download your reading (PDF)</a>
       <p style="margin:22px 0 0;color:#726a5c;font-size:12px;line-height:1.8">This secure link works once and expires in 48 hours. If you didn't request this, please ignore this email.</p>
