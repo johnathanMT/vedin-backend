@@ -14,6 +14,7 @@ using PortfolioApi.Interfaces;
 using PortfolioApi.Models;
 using PortfolioApi.Security;
 using PortfolioApi.Services;
+using PortfolioApi.Services.Ai;
 using PortfolioApi.Services.Pdf;
 
 namespace PortfolioApi.Controllers;
