@@ -100,4 +100,37 @@ Known defects to fix:
 
         return ApiResponse<string>.Ok(result.Data!.Trim(), "Polished.");
     }
+
+    /// <summary>
+    /// Streaming counterpart of <see cref="RunAsync"/> for a live-generation UI: it forwards
+    /// the synthesised reading through the same language editor and yields the corrected
+    /// document token-by-token. Unlike RunAsync it does not short-circuit clean/English text —
+    /// the caller has explicitly chosen to show progress — so it always streams what it is given.
+    /// </summary>
+    public IAsyncEnumerable<string> StreamAsync(ReadingContext ctx, CancellationToken ct = default)
+    {
+        var text = ctx.Get(SynthesisStep.StepId);
+
+        // English (or empty) has nothing to edit — replay the text as a single chunk so the
+        // consumer's contract (an async stream of deltas) still holds.
+        if (string.IsNullOrWhiteSpace(text) || !ctx.Burmese)
+            return One(text);
+
+        var user =
+$"""
+Edit the Burmese astrology reading below for language quality and markdown hygiene only.
+Replace any leaked English words with natural Burmese and repair any header that mixes "#" with "*".
+
+=== DOCUMENT ===
+{text}
+""";
+        return _model.StreamCompleteAsync(System, user,
+            new ChatOptions { Temperature = 0.2, MaxOutputTokens = 8192 }, ct);
+    }
+
+    private static async IAsyncEnumerable<string> One(string text)
+    {
+        await Task.CompletedTask;
+        if (!string.IsNullOrEmpty(text)) yield return text;
+    }
 }

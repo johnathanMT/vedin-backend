@@ -32,12 +32,13 @@ public class AstrologyController : ControllerBase
     private readonly IEmailService _email;
     private readonly IConfiguration _cfg;
     private readonly IAiReadingService _ai;
+    private readonly IChatModel _model;
     private readonly IChartCache _cache;
     private readonly IReadingJobQueue _jobs;
     private readonly IReadingPdfService _pdf;
     private readonly string _encKey;
 
-    public AstrologyController(IAstrologyService service, AppDbContext db, IEmailService email, IConfiguration cfg, IAiReadingService ai, IChartCache cache, IReadingJobQueue jobs, IReadingPdfService pdf)
+    public AstrologyController(IAstrologyService service, AppDbContext db, IEmailService email, IConfiguration cfg, IAiReadingService ai, IChatModel model, IChartCache cache, IReadingJobQueue jobs, IReadingPdfService pdf)
     {
         _pdf = pdf;
         _service = service;
@@ -45,6 +46,7 @@ public class AstrologyController : ControllerBase
         _email = email;
         _cfg = cfg;
         _ai = ai;
+        _model = model;
         _cache = cache;
         _jobs = jobs;
         // Dedicated key preferred; falls back to the JWT key so it works out of the box.
@@ -639,6 +641,151 @@ public class AstrologyController : ControllerBase
 
         return Ok(ApiResponse.OkNoData("PDF request sent to the Sayar."));
     }
+
+    // ═════════════════════════════════════════════════════════════════════════════
+    //  GROUNDED CONVERSATIONAL FOLLOW-UP  (Task 6)
+    //  The querent asks a question about THEIR finished reading; the model may use
+    //  ONLY the computed chart facts + the reading text, and declines anything else.
+    // ═════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>Answer a follow-up question strictly grounded in the querent's own reading.</summary>
+    [HttpPost("reading/{id:int}/ask")]
+    [Authorize]
+    [EnableRateLimiting("ai")]
+    [ProducesResponseType(typeof(ApiResponse<ReadingAnswerDto>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> AskReading(int id, [FromBody] ReadingAskDto dto, CancellationToken ct)
+    {
+        if (!TryCustomerId(out int cid))
+            return Unauthorized(ApiResponse<object>.Fail("Not a customer token.", 401));
+        if (!ModelState.IsValid || string.IsNullOrWhiteSpace(dto?.Question))
+            return BadRequest(ApiResponse<object>.Fail("A question is required.", 400));
+
+        var (row, chart, markdown) = await LoadOwnedReadingAsync(id, cid, ct);
+        if (row is null) return NotFound(ApiResponse<object>.Fail("Reading not found.", 404));
+
+        var burmese = chart is null || !string.Equals(chart.Language, "en", StringComparison.OrdinalIgnoreCase);
+        var facts = chart is null ? "(chart facts unavailable)" : new ReadingContext { Chart = chart }.ChartFacts();
+
+        var user =
+$"""
+{facts}
+
+=== THE READING ALREADY PREPARED FOR THE QUERENT ===
+{markdown}
+
+=== THE QUERENT'S FOLLOW-UP QUESTION ===
+{dto!.Question.Trim()}
+""";
+
+        var result = await _model.CompleteAsync(AskSystem(burmese), user,
+            new ChatOptions { Temperature = 0.2, MaxOutputTokens = 1200 }, ct);
+
+        if (!result.Success || string.IsNullOrWhiteSpace(result.Data))
+            return StatusCode(result.StatusCode, ApiResponse<object>.Fail(result.Message, result.StatusCode));
+
+        return Ok(ApiResponse<ReadingAnswerDto>.Ok(new ReadingAnswerDto { Answer = result.Data!.Trim() }, "OK"));
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════
+    //  STREAMING READING  (Task 7) — Server-Sent Events
+    //  The reading is already generated AND grounding-checked, so this streams the
+    //  STORED text token-by-token rather than re-invoking the model: re-running the
+    //  LLM on every open would spend tokens and could drift from the approved,
+    //  grounded reading. The SSE framing matches a live model stream, so the client
+    //  hook is identical whether the tokens originate here or from IChatModel.
+    // ═════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>Stream the querent's approved reading token-by-token as SSE.</summary>
+    [HttpGet("reading/{id:int}/stream")]
+    [Authorize]
+    [EnableRateLimiting("ai")]
+    public async Task StreamReading(int id, CancellationToken ct)
+    {
+        // Resolve auth + ownership BEFORE any body is written, so a failure is a real
+        // HTTP status rather than an SSE error event on a 200 response.
+        if (!TryCustomerId(out int cid)) { Response.StatusCode = StatusCodes.Status401Unauthorized; return; }
+
+        var (row, _, markdown) = await LoadOwnedReadingAsync(id, cid, ct);
+        if (row is null || string.IsNullOrEmpty(markdown))
+        {
+            Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        Response.ContentType = "text/event-stream";
+        Response.Headers.CacheControl = "no-cache";
+        Response.Headers.Connection = "keep-alive";
+        Response.Headers["X-Accel-Buffering"] = "no";   // stop nginx/CDN from buffering the stream
+
+        try
+        {
+            foreach (var chunk in ChunkGraphemes(markdown!, 6))
+            {
+                if (ct.IsCancellationRequested) break;
+                var payload = JsonSerializer.Serialize(new { t = chunk });
+                await Response.WriteAsync($"data: {payload}\n\n", ct);
+                await Response.Body.FlushAsync(ct);
+                await Task.Delay(10, ct);   // gentle typing cadence
+            }
+            await Response.WriteAsync("event: done\ndata: 1\n\n", ct);
+            await Response.Body.FlushAsync(ct);
+        }
+        catch (OperationCanceledException) { /* the querent navigated away — normal */ }
+    }
+
+    /// <summary>Load an Approved reading owned by this customer, with its chart snapshot
+    /// (for grounding) and decrypted markdown. Returns nulls when there is no match.</summary>
+    private async Task<(ReadingRequest? Row, AiReadingRequestDto? Chart, string? Markdown)>
+        LoadOwnedReadingAsync(int id, int customerId, CancellationToken ct)
+    {
+        var row = await _db.ReadingRequests
+            .FirstOrDefaultAsync(r => r.Id == id && r.CustomerId == customerId, ct);
+        if (row is null || row.Status != "Approved" || string.IsNullOrEmpty(row.Markdown))
+            return (null, null, null);
+
+        AiReadingRequestDto? chart = null;
+        try { chart = JsonSerializer.Deserialize<AiReadingRequestDto>(FieldCrypto.Decrypt(row.PayloadJson, _encKey)); }
+        catch { /* an unreadable snapshot only costs grounding richness, not the answer */ }
+
+        return (row, chart, SafeDecrypt(row.Markdown!));
+    }
+
+    /// <summary>Split text into small grapheme-cluster chunks so a Burmese stream reveals
+    /// smoothly without ever slicing a combining cluster mid-character.</summary>
+    private static IEnumerable<string> ChunkGraphemes(string text, int perChunk)
+    {
+        var e = System.Globalization.StringInfo.GetTextElementEnumerator(text);
+        var sb = new StringBuilder();
+        var n = 0;
+        while (e.MoveNext())
+        {
+            sb.Append((string)e.Current);
+            if (++n >= perChunk) { yield return sb.ToString(); sb.Clear(); n = 0; }
+        }
+        if (sb.Length > 0) yield return sb.ToString();
+    }
+
+    /// <summary>System prompt for a grounded follow-up: chart + reading are the only
+    /// admissible facts, and anything outside that scope is politely declined.</summary>
+    private static string AskSystem(bool burmese) =>
+$"""
+You are the astrologer's assistant, answering a querent's follow-up question about a Vedic
+reading that has ALREADY been prepared for them. Rules you must never break:
+
+1. Answer using ONLY the CHART SNAPSHOT facts and the READING text provided below. These are
+   the only admissible facts. Do not compute or assume any placement, dasha, date, yoga, or
+   prediction that is not present in them.
+2. When you make a point, anchor it to the specific placement, house, dasha, or reading
+   section that supports it, so the querent can see where the answer comes from.
+3. If the question falls outside the scope of this chart or reading — about other people,
+   general knowledge, or medical, legal, or financial decisions, or details the chart simply
+   does not contain — politely decline in a sentence or two and suggest two or three relevant
+   questions the querent COULD ask about their own chart (a specific house, a dasha period, or
+   one of the life areas the reading covers).
+4. Be warm, concise, and specific. A few short paragraphs at most.
+5. Write your entire answer in {(burmese ? "Burmese (မြန်မာဘာသာဖြင့်သာ)" : "English")}.
+""";
 
     // ── Admin: list reading requests (optionally filter by status) ──────────────
     [HttpGet("admin/reading-requests")]

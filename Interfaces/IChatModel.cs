@@ -27,6 +27,15 @@ public interface IChatModel
     Task<ApiResponse<string>> CompleteAsync(
         string systemPrompt, string userPrompt, ChatOptions? options = null, CancellationToken ct = default);
 
+    /// <summary>
+    /// Streams a completion as text deltas, in order, as the provider produces them —
+    /// so a caller can forward tokens to the client without waiting for the whole
+    /// document. A provider that cannot stream (or fails to start) simply yields
+    /// nothing, and the caller falls back to the stored/complete text.
+    /// </summary>
+    IAsyncEnumerable<string> StreamCompleteAsync(
+        string systemPrompt, string userPrompt, ChatOptions? options = null, CancellationToken ct = default);
+
     /// <summary>Verifies key + model against the provider without generating anything.</summary>
     Task<ApiResponse<object>> CheckHealthAsync(CancellationToken ct = default);
 }

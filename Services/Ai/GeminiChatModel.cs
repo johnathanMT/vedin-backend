@@ -117,6 +117,72 @@ public sealed class GeminiChatModel : IChatModel
         }
     }
 
+    public async IAsyncEnumerable<string> StreamCompleteAsync(
+        string systemPrompt, string userPrompt, ChatOptions? options = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var (apiKey, keySource, error) = ResolveKey();
+        if (error is not null)
+        {
+            _log.LogWarning("Streaming requested but key unavailable ({Source}).", keySource);
+            yield break;   // caller falls back to non-streamed / stored text
+        }
+
+        var opts = options ?? new ChatOptions();
+        // alt=sse turns Gemini's streamGenerateContent into a line-oriented Server-Sent
+        // Events feed: each "data:" line is one GenerateContentResponse chunk.
+        var url = $"{BaseUrl}/models/{ModelId}:streamGenerateContent?alt=sse";
+
+        var payload = new
+        {
+            systemInstruction = new { parts = new[] { new { text = systemPrompt } } },
+            contents = new[] { new { role = "user", parts = new[] { new { text = userPrompt } } } },
+            generationConfig = new
+            {
+                temperature = opts.Temperature,
+                topP = opts.TopP,
+                maxOutputTokens = opts.MaxOutputTokens,
+            },
+        };
+
+        using var msg = new HttpRequestMessage(HttpMethod.Post, url);
+        msg.Headers.TryAddWithoutValidation("x-goog-api-key", apiKey);
+        msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+        // ResponseHeadersRead so we start reading the body before it is fully received.
+        using var resp = await _http.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errBody = await resp.Content.ReadAsStringAsync(ct);
+            _log.LogError("Gemini stream FAILED {Status}. Provider response: {Body}",
+                (int)resp.StatusCode, Truncate(errBody, 600));
+            yield break;
+        }
+
+        using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream);
+
+        while (!reader.EndOfStream && !ct.IsCancellationRequested)
+        {
+            var line = await reader.ReadLineAsync(ct);
+            if (line is null) break;
+            if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+
+            var json = line["data:".Length..].Trim();
+            if (json.Length == 0 || json == "[DONE]") continue;
+
+            string? delta = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                delta = ExtractText(doc.RootElement);   // this chunk's text part(s)
+            }
+            catch (JsonException) { /* a partial/keepalive line — skip it */ }
+
+            if (!string.IsNullOrEmpty(delta)) yield return delta!;
+        }
+    }
+
     public async Task<ApiResponse<object>> CheckHealthAsync(CancellationToken ct = default)
     {
         var (apiKey, keySource, error) = ResolveKey();
