@@ -22,6 +22,10 @@ using PortfolioApi.Middleware;
 using PortfolioApi.Models;
 using PortfolioApi.Repositories;
 using PortfolioApi.Services;
+using PortfolioApi.Services.Ai;
+using PortfolioApi.Services.Ai.Steps;
+using PortfolioApi.Services.Jobs;
+using PortfolioApi.Services.Pdf;
 using PortfolioApi.Validators;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -91,13 +95,36 @@ builder.Services.AddScoped<IEmailService, SmtpEmailService>();
 builder.Services.AddMemoryCache();   // resend-confirmation anti-spam throttling
 
 // AI reading: typed HttpClient → Google Gemini (generativelanguage.googleapis.com).
-// Config via AI__GeminiApiKey / AI__Model (default gemini-2.0-flash) / AI__BaseUrl.
-// 60s timeout (LLMs are slow). To switch back to an OpenAI-compatible provider,
-// register OpenAiReadingService instead (it remains in the codebase).
-builder.Services.AddHttpClient<IAiReadingService, GeminiReadingService>(c =>
+// Config via AI__GeminiApiKey / AI__Model / AI__BaseUrl. 60s per call (LLMs are slow);
+// the pipeline makes several, but it runs in a background job so nothing waits on it.
+builder.Services.AddHttpClient<IChatModel, GeminiChatModel>(c =>
 {
     c.Timeout = TimeSpan.FromSeconds(60);
 });
+
+// The reading is generated as a chain of small, individually validated steps rather
+// than one large prompt — see ReadingPipeline for why.
+builder.Services.AddScoped<ChartAnalysisStep>();
+builder.Services.AddScoped<LifeAreaDraftStep>();
+builder.Services.AddScoped<SynthesisStep>();
+builder.Services.AddScoped<LanguagePolishStep>();
+builder.Services.AddScoped<IAiReadingService, ReadingPipeline>();
+
+// Reading generation runs off the request path: approving a request enqueues it and
+// returns immediately, and ReadingJobWorker drains the queue. The queue is a
+// singleton (it holds the channel); the worker resolves scoped services per job.
+builder.Services.AddSingleton<IReadingJobQueue, ReadingJobQueue>();
+builder.Services.AddHostedService<ReadingJobWorker>();
+
+// Two-tier chart cache — memory in front, database behind, so the ephemeris work
+// isn't repeated after every deploy or Render cold start.
+builder.Services.AddScoped<IChartCache, ChartCache>();
+
+// QuestPDF Community License (v3.0): free for businesses under USD 1M annual gross
+// revenue, and not available to publicly traded or public-sector entities. Revisit
+// this declaration if Vedin's revenue or ownership changes — see questpdf.com/license.
+QuestPDF.Settings.License = QuestPDF.Infrastructure.LicenseType.Community;
+builder.Services.AddSingleton<IReadingPdfService, ReadingPdfService>();
 
 // ─────────────────────────────────────────────────────────────
 // 3. FLUENT VALIDATION
@@ -583,9 +610,33 @@ CREATE TABLE IF NOT EXISTS ConsultationMessages (
   IsRead TINYINT(1) NOT NULL DEFAULT 0,
   KEY ix_consult_customer (CustomerId)
 ) CHARACTER SET=utf8mb4;");
+        await db.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ChartCacheEntries (
+  Id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  CacheKey CHAR(64) NOT NULL,
+  ChartJson MEDIUMTEXT NOT NULL,
+  CreatedAt DATETIME(6) NOT NULL,
+  LastAccessedAt DATETIME(6) NOT NULL,
+  UNIQUE KEY uq_chartcache_key (CacheKey)
+) CHARACTER SET=utf8mb4;");
+        await db.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ReadingStepOutputs (
+  Id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  ReadingRequestId INT NOT NULL,
+  StepId VARCHAR(40) NOT NULL,
+  Content MEDIUMTEXT NOT NULL,
+  CreatedAt DATETIME(6) NOT NULL,
+  UNIQUE KEY uq_stepoutput (ReadingRequestId, StepId)
+) CHARACTER SET=utf8mb4;");
         // Additive columns (idempotent — ignore "column exists" on already-migrated DBs).
         foreach (var alter in new[]
         {
+            // Background reading generation bookkeeping.
+            "ALTER TABLE ReadingRequests ADD COLUMN Attempts INT NOT NULL DEFAULT 0",
+            "ALTER TABLE ReadingRequests ADD COLUMN LastError TEXT NULL",
+            // Pre-rendered premium report, so download is a stream not a render.
+            "ALTER TABLE ReadingRequests ADD COLUMN PdfDocument MEDIUMBLOB NULL",
+            "ALTER TABLE ReadingRequests ADD COLUMN PdfGeneratedAt DATETIME(6) NULL",
             "ALTER TABLE RemedyRequests ADD COLUMN Status VARCHAR(20) NOT NULL DEFAULT 'Pending'",
             "ALTER TABLE RemedyRequests ADD COLUMN Notes TEXT NULL",
             "ALTER TABLE ReadingRequests ADD COLUMN PdfSent TINYINT(1) NOT NULL DEFAULT 0",

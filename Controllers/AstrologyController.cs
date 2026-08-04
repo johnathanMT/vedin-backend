@@ -14,6 +14,7 @@ using PortfolioApi.Interfaces;
 using PortfolioApi.Models;
 using PortfolioApi.Security;
 using PortfolioApi.Services;
+using PortfolioApi.Services.Pdf;
 
 namespace PortfolioApi.Controllers;
 
@@ -31,17 +32,21 @@ public class AstrologyController : ControllerBase
     private readonly IEmailService _email;
     private readonly IConfiguration _cfg;
     private readonly IAiReadingService _ai;
-    private readonly IMemoryCache _cache;
+    private readonly IChartCache _cache;
+    private readonly IReadingJobQueue _jobs;
+    private readonly IReadingPdfService _pdf;
     private readonly string _encKey;
 
-    public AstrologyController(IAstrologyService service, AppDbContext db, IEmailService email, IConfiguration cfg, IAiReadingService ai, IMemoryCache cache)
+    public AstrologyController(IAstrologyService service, AppDbContext db, IEmailService email, IConfiguration cfg, IAiReadingService ai, IChartCache cache, IReadingJobQueue jobs, IReadingPdfService pdf)
     {
+        _pdf = pdf;
         _service = service;
         _db = db;
         _email = email;
         _cfg = cfg;
         _ai = ai;
         _cache = cache;
+        _jobs = jobs;
         // Dedicated key preferred; falls back to the JWT key so it works out of the box.
         _encKey = cfg["Astrology:EncryptionKey"] ?? cfg["Jwt:Key"] ?? "astrology-fallback-key-set-in-env";
     }
@@ -68,7 +73,7 @@ public class AstrologyController : ControllerBase
     [EnableRateLimiting("astrology")]
     [ProducesResponseType(typeof(ApiResponse<BirthChartData>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status400BadRequest)]
-    public IActionResult Chart([FromBody] BirthChartRequest req)
+    public async Task<IActionResult> Chart([FromBody] BirthChartRequest req, CancellationToken ct)
     {
         if (!ModelState.IsValid)
             return BadRequest(ApiResponse<object>.Fail(
@@ -79,24 +84,22 @@ public class AstrologyController : ControllerBase
         // ComputeRasiChart is a pure, deterministic Swiss Ephemeris calculation:
         // identical birth inputs always yield the identical chart. Caching the
         // result keyed on those inputs turns repeat "check chart" clicks (same
-        // person re-opening, switching tabs, retries) into instant memory hits and
-        // takes the heavy ephemeris math off the CPU. Output is public (returned to
-        // the caller anyway), so there's no per-user data-leak risk.
+        // person re-opening, switching tabs, retries) into instant hits and takes
+        // the heavy ephemeris math off the CPU. Output is public (returned to the
+        // caller anyway), so there's no per-user data-leak risk.
+        //
+        // The cache is two-tier: memory for hot reads, database underneath so a
+        // Render cold start or deploy doesn't throw the whole cache away.
         var cacheKey = "chart:" +
             $"{req.Year:0000}-{req.Month:00}-{req.Day:00}T{req.Hour:00}:{req.Minute:00}:{req.Second:00}|" +
             $"{req.TimeZone}|{req.Latitude:F5}|{req.Longitude:F5}|{req.Ayanamsa?.ToLowerInvariant()}";
 
-        if (!_cache.TryGetValue(cacheKey, out ApiResponse<BirthChartData>? result) || result is null)
+        var result = await _cache.GetAsync(cacheKey, ct);
+        if (result is null)
         {
             result = _service.ComputeRasiChart(req);
-            // Only cache successful computes; sliding + absolute cap keeps memory bounded.
             if (result.StatusCode == 200)
-                _cache.Set(cacheKey, result, new MemoryCacheEntryOptions
-                {
-                    SlidingExpiration = TimeSpan.FromHours(6),
-                    AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(24),
-                    Size = 1,
-                });
+                await _cache.SetAsync(cacheKey, result, ct);   // only memoise successful computes
         }
 
         return result.StatusCode switch
@@ -364,34 +367,46 @@ public class AstrologyController : ControllerBase
     // ── Public: secure one-time PDF download ────────────────────────────────────
     [HttpGet("download-pdf")]
     [EnableRateLimiting("general")]
-    public async Task<IActionResult> DownloadPdf([FromQuery] string token)
+    public async Task<IActionResult> DownloadPdf([FromQuery] string token, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(token)) return BadRequest("Missing token.");
-        var row = await _db.PdfRequests.FirstOrDefaultAsync(r => r.DownloadToken == token);
+        var row = await _db.PdfRequests.FirstOrDefaultAsync(r => r.DownloadToken == token, ct);
         if (row is null || row.ApprovalStatus != "Approved" || row.TokenExpiry is null || row.TokenExpiry < DateTime.UtcNow)
             return StatusCode(410, "This link is invalid, already used, or expired.");
 
         string name = FieldCrypto.Decrypt(row.Name, _encKey);
         string birth = FieldCrypto.Decrypt(row.BirthInfo, _encKey);
-        var pdf = MiniPdf.Build("Vedin - Vedic Astrology Reading", new[]
+
+        // Prefer the report already rendered by the background job for this querent;
+        // fall back to a cover-only report so the link never dead-ends.
+        var stored = await FindRenderedReport(name, ct);
+        var pdf = stored ?? _pdf.Render(new VedinReportModel
         {
-            "Sayar Bhone Min Thike Din - Professional Vedic Astrology",
-            "",
-            string.IsNullOrWhiteSpace(name) ? "Reading for: (querent)" : $"Reading for: {name}",
-            string.IsNullOrWhiteSpace(birth) ? "" : $"Birth: {birth}",
-            "",
-            "Thank you for your request. Your reading document has been",
-            "securely approved and delivered via this one-time link.",
-            "",
-            "(Placeholder PDF — the full encyclopedia layout is generated",
-            " from your computed chart.)",
+            QuerentName = name,
+            BirthDate = string.IsNullOrWhiteSpace(birth) ? null : birth,
         });
 
         row.ApprovalStatus = "Downloaded";   // one-time: invalidate the link
         row.DownloadToken = string.Empty;
-        await _db.SaveChangesAsync();
+        await _db.SaveChangesAsync(ct);
 
         return File(pdf, "application/pdf", "vedin-reading.pdf");
+    }
+
+    /// <summary>Most recent pre-rendered report for a querent name, if one exists.</summary>
+    private async Task<byte[]?> FindRenderedReport(string name, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        var candidates = await _db.ReadingRequests
+            .Where(r => r.Status == "Approved" && r.PdfDocument != null)
+            .OrderByDescending(r => r.ApprovedAt)
+            .Take(50)
+            .ToListAsync(ct);
+
+        // QuerentName is encrypted at rest, so the match happens after decryption.
+        return candidates
+            .FirstOrDefault(r => string.Equals(SafeDecrypt(r.QuerentName), name, StringComparison.OrdinalIgnoreCase))
+            ?.PdfDocument;
     }
 
     // Premium branded HTML email (purple / gold).
@@ -431,7 +446,8 @@ public class AstrologyController : ControllerBase
                 "Validation failed.", 400,
                 ModelState.Values.SelectMany(v => v.Errors).Select(e => e.ErrorMessage).ToList()));
 
-        var result = await _ai.GenerateAsync(req, ct);
+        // No request row to resume from — this is the admin's direct, ad-hoc generation.
+        var result = await _ai.GenerateAsync(req, null, ct);
 
         // Auto-persist for signed-in customers so the reading isn't lost.
         if (result.Success && result.Data is not null && TryCustomerId(out int cid))
@@ -618,8 +634,16 @@ public class AstrologyController : ControllerBase
     public async Task<IActionResult> AdminReadingRequests([FromQuery] string? status)
     {
         var query = _db.ReadingRequests.AsQueryable();
-        if (!string.IsNullOrWhiteSpace(status))
+        if (string.Equals(status, "Generating", StringComparison.OrdinalIgnoreCase))
+        {
+            // One admin tab for everything the worker owns, so a queued, in-flight or
+            // failed reading can never fall between the Pending/Approved/Rejected tabs.
+            query = query.Where(r => r.Status == "Queued" || r.Status == "Processing" || r.Status == "Failed");
+        }
+        else if (!string.IsNullOrWhiteSpace(status))
+        {
             query = query.Where(r => r.Status == status);
+        }
 
         var rows = await query.OrderByDescending(r => r.CreatedAt).Take(500).ToListAsync();
         var accounts = await LoadAccounts(rows);
@@ -675,6 +699,8 @@ public class AstrologyController : ControllerBase
         PdfRequested = r.PdfRequested,
         CreatedAt = r.CreatedAt.ToString("yyyy-MM-dd HH:mm"),
         ApprovedAt = r.ApprovedAt?.ToString("yyyy-MM-dd HH:mm"),
+        Attempts = r.Attempts,
+        LastError = r.LastError,
         // Registered-account context (decrypted) — null for guests.
         IsRegistered = account is not null,
         AccountEmail = account?.Email,
@@ -694,8 +720,13 @@ public class AstrologyController : ControllerBase
         try { return FieldCrypto.Decrypt(cipher, _encKey); } catch { return null; }
     }
 
-    /// <summary>Admin approves a request — THIS is the only path that calls the AI.
-    /// Generates the reading, encrypts + stores it, and flips status to Approved.</summary>
+    /// <summary>Admin approves a request — THIS is the only path that triggers the AI.
+    /// <para>
+    /// Approval no longer generates inline. It validates the stored payload, marks the
+    /// row Queued and hands it to the background worker, so the Sayar gets an immediate
+    /// response instead of holding a request open for up to 60s, and a provider blip
+    /// retries in the background rather than failing the approval outright.
+    /// </para></summary>
     [HttpPost("admin/reading-requests/{id:int}/approve")]
     [Authorize(Policy = "AdminOnly")]
     public async Task<IActionResult> ApproveReading(int id, CancellationToken ct)
@@ -704,23 +735,42 @@ public class AstrologyController : ControllerBase
         if (row is null) return NotFound(ApiResponse<object>.Fail("Request not found.", 404));
         if (row.Status == "Approved" && !string.IsNullOrEmpty(row.Markdown))
             return Ok(ApiResponse<object>.Ok(new { row.Id, row.Status }, "Already approved."));
+        if (row.Status is "Queued" or "Processing")
+            return Ok(ApiResponse<object>.Ok(new { row.Id, row.Status }, "Already generating."));
 
+        // Fail fast on an unreadable payload — no point queueing work that cannot run.
         AiReadingRequestDto? payload;
         try { payload = JsonSerializer.Deserialize<AiReadingRequestDto>(FieldCrypto.Decrypt(row.PayloadJson, _encKey)); }
         catch { return StatusCode(500, ApiResponse<object>.Fail("Could not read the stored chart payload.", 500)); }
         if (payload is null) return StatusCode(500, ApiResponse<object>.Fail("Empty chart payload.", 500));
 
-        var result = await _ai.GenerateAsync(payload, ct);
-        if (!result.Success || result.Data is null)
-            return StatusCode(result.StatusCode, result);   // surface the AI error to the admin
-
-        row.Markdown = FieldCrypto.Encrypt(result.Data.Markdown, _encKey);
-        row.Model = result.Data.Model;
-        row.Status = "Approved";
-        row.ApprovedAt = DateTime.UtcNow;
+        row.Status = "Queued";
+        row.Attempts = 0;
+        row.LastError = null;
         await _db.SaveChangesAsync(ct);
 
-        return Ok(ApiResponse<object>.Ok(new { row.Id, row.Status, model = row.Model }, "Approved & generated."));
+        if (!_jobs.TryEnqueue(row.Id))
+        {
+            row.Status = "Pending";   // back-pressure: leave it reviewable rather than lost
+            await _db.SaveChangesAsync(ct);
+            return StatusCode(503, ApiResponse<object>.Fail(
+                "The reading queue is saturated. Try again shortly.", 503));
+        }
+
+        return Accepted(ApiResponse<object>.Ok(
+            new { row.Id, row.Status, queueDepth = _jobs.Depth },
+            "Approved — the reading is generating in the background."));
+    }
+
+    /// <summary>Admin-only: how many readings are waiting on the worker.</summary>
+    [HttpGet("admin/reading-queue")]
+    [Authorize(Policy = "AdminOnly")]
+    public async Task<IActionResult> ReadingQueueDepth(CancellationToken ct)
+    {
+        var inFlight = await _db.ReadingRequests
+            .CountAsync(r => r.Status == "Queued" || r.Status == "Processing", ct);
+        var failed = await _db.ReadingRequests.CountAsync(r => r.Status == "Failed", ct);
+        return Ok(ApiResponse<object>.Ok(new { queued = _jobs.Depth, inFlight, failed }));
     }
 
     /// <summary>Admin rejects a request (no AI call).</summary>

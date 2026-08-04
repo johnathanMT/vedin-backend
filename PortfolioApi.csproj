@@ -21,6 +21,7 @@
     <!-- Authentication & Security -->
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.6" />
     <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
+    <PackageReference Include="QuestPDF" Version="2026.7.2" />
 
     <!-- API Documentation -->
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.7.3" />

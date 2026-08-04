@@ -21,11 +21,26 @@ public class ReadingRequest
     public string QuerentName { get; set; } = string.Empty;   // encrypted (admin display)
     public string PayloadJson { get; set; } = string.Empty;   // encrypted AiReadingRequestDto snapshot
 
-    /// <summary>Pending | Approved | Rejected</summary>
+    /// <summary>Pending | Queued | Processing | Approved | Rejected | Failed.
+    /// Approval enqueues rather than generating inline, so a request passes through
+    /// Queued/Processing before it reaches Approved.</summary>
     public string Status { get; set; } = "Pending";
 
-    public string? Markdown { get; set; }   // encrypted, filled at approval
+    public string? Markdown { get; set; }   // encrypted, filled once generation succeeds
     public string? Model { get; set; }
+
+    /// <summary>Generation attempts so far — the worker retries a transient provider
+    /// failure a few times before parking the row as Failed.</summary>
+    public int Attempts { get; set; }
+
+    /// <summary>Why the last generation attempt failed, shown to the Sayar so a stuck
+    /// reading is diagnosable without reading server logs.</summary>
+    public string? LastError { get; set; }
+
+    /// <summary>The rendered premium report, built in the same background job as the
+    /// reading so the querent's download is a byte-stream rather than a render.</summary>
+    public byte[]? PdfDocument { get; set; }
+    public DateTime? PdfGeneratedAt { get; set; }
 
     /// <summary>The querent has asked for the finished reading as a PDF by email.</summary>
     public bool PdfRequested { get; set; }

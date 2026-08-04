@@ -25,6 +25,8 @@ public class AppDbContext : DbContext
     public DbSet<ResearchJournalEntry> ResearchJournalEntries { get; set; }
     public DbSet<ReadingRequest>       ReadingRequests       { get; set; }
     public DbSet<ConsultationMessage>  ConsultationMessages  { get; set; }
+    public DbSet<ChartCacheEntry>      ChartCacheEntries     { get; set; }
+    public DbSet<ReadingStepOutput>    ReadingStepOutputs    { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

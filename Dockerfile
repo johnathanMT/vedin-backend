@@ -29,6 +29,18 @@ RUN dotnet publish "./PortfolioApi.csproj" \
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
 
+# QuestPDF renders through SkiaSharp/HarfBuzz, which needs the native font stack.
+# Padauk and Noto Sans Myanmar are installed from Debian rather than committed as
+# TTF blobs — without them the PDF renderer has no glyphs for Burmese and the
+# report silently falls back to boxes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fonts-padauk \
+        fonts-noto-core \
+        fontconfig \
+        libfontconfig1 \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
 # Security: run as a non-root user
 RUN addgroup --system --gid 1001 appgroup && \
     adduser  --system --uid 1001 --ingroup appgroup --no-create-home appuser

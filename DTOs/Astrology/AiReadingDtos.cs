@@ -97,6 +97,11 @@ public class ReadingRequestAdminView
     public string CreatedAt { get; set; } = string.Empty;
     public string? ApprovedAt { get; set; }
 
+    /// <summary>Generation attempts and the last failure reason, so a stuck reading is
+    /// diagnosable from the admin screen rather than only from server logs.</summary>
+    public int Attempts { get; set; }
+    public string? LastError { get; set; }
+
     // ── Registered-account context (null for guest requests) ────────────────────
     public bool IsRegistered { get; set; }
     public string? AccountEmail { get; set; }

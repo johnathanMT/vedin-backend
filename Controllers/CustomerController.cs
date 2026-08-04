@@ -16,6 +16,7 @@ using PortfolioApi.Interfaces;
 using PortfolioApi.Models;
 using PortfolioApi.Security;
 using PortfolioApi.Services;
+using PortfolioApi.Services.Pdf;
 
 namespace PortfolioApi.Controllers;
 
@@ -35,10 +36,12 @@ public class CustomerController : ControllerBase
     private readonly IConfiguration _cfg;
     private readonly IMemoryCache _cache;
     private readonly ILogger<CustomerController> _log;
+    private readonly IReadingPdfService _pdf;
     private readonly string _encKey;
 
-    public CustomerController(AppDbContext db, IEmailService email, IConfiguration cfg, IMemoryCache cache, ILogger<CustomerController> log)
+    public CustomerController(AppDbContext db, IEmailService email, IConfiguration cfg, IMemoryCache cache, ILogger<CustomerController> log, IReadingPdfService pdf)
     {
+        _pdf = pdf;
         _db = db;
         _email = email;
         _cfg = cfg;
@@ -641,24 +644,35 @@ public class CustomerController : ControllerBase
     // ── Account-based PDF download (no admin approval, no SMTP) ──────────────────
     [HttpGet("download-pdf")]
     [Authorize]
-    public async Task<IActionResult> DownloadPdf([FromQuery] int? chartId)
+    public async Task<IActionResult> DownloadPdf([FromQuery] int? chartId, CancellationToken ct)
     {
         if (!TryCustomerId(out int id)) return Unauthorized(ApiResponse<object>.Fail("Not a customer token.", 401));
         var q = _db.CustomerCharts.Where(c => c.CustomerId == id);
         var chart = chartId is int cid
-            ? await q.FirstOrDefaultAsync(c => c.Id == cid)
-            : await q.OrderByDescending(c => c.CreatedAt).FirstOrDefaultAsync();
+            ? await q.FirstOrDefaultAsync(c => c.Id == cid, ct)
+            : await q.OrderByDescending(c => c.CreatedAt).FirstOrDefaultAsync(ct);
         if (chart is null) return NotFound(ApiResponse<object>.Fail("No saved chart to export.", 404));
+
+        // If this account already has an approved reading, its report was rendered by
+        // the background job — serve those bytes rather than re-rendering.
+        var stored = await _db.ReadingRequests
+            .Where(r => r.CustomerId == id && r.Status == "Approved" && r.PdfDocument != null)
+            .OrderByDescending(r => r.ApprovedAt)
+            .Select(r => r.PdfDocument)
+            .FirstOrDefaultAsync(ct);
+        if (stored is not null)
+            return File(stored, "application/pdf", "vedin-reading.pdf");
 
         string name = FieldCrypto.Decrypt(chart.Name, _encKey);
         string bd = FieldCrypto.Decrypt(chart.BirthDate, _encKey);
         string bt = FieldCrypto.Decrypt(chart.BirthTime, _encKey);
-        var pdf = MiniPdf.Build("Vedin - Vedic Astrology Reading", new[]
+
+        var pdf = _pdf.Render(new VedinReportModel
         {
-            "Sayar Bhone Min Thike Din - Professional Vedic Astrology", "",
-            string.IsNullOrWhiteSpace(name) ? "Reading for: (you)" : $"Reading for: {name}",
-            $"Birth: {bd} {bt}".Trim(), "",
-            "Your reading document, generated from your saved chart.",
+            QuerentName = name,
+            BirthDate = string.IsNullOrWhiteSpace(bd) ? null : bd,
+            BirthTime = string.IsNullOrWhiteSpace(bt) ? null : bt,
+            Location = FieldCrypto.Decrypt(chart.Location, _encKey),
         });
         return File(pdf, "application/pdf", "vedin-reading.pdf");
     }
