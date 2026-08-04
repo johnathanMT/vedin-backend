@@ -29,15 +29,31 @@ RUN dotnet publish "./PortfolioApi.csproj" \
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
 
-# QuestPDF renders through SkiaSharp/HarfBuzz, which needs the native font stack.
-# Padauk and Noto Sans Myanmar are installed from Debian rather than committed as
-# TTF blobs — without them the PDF renderer has no glyphs for Burmese and the
-# report silently falls back to boxes.
+# QuestPDF renders through SkiaSharp/HarfBuzz and needs BOTH the native font stack
+# and real font files. The Myanmar font packages are NOT reliably available via apt on
+# this base image (the build failed with "Unable to locate package fonts-padauk"), so
+# we install the native libs + a Latin face (DejaVu, always in the main repo) via apt,
+# and fetch the Burmese fonts (Padauk + Noto Sans Myanmar) as TTFs directly. These match
+# the exact family names VedinTheme.cs requests ("Padauk", "Noto Sans Myanmar",
+# "DejaVu Sans"). Without them Burmese silently renders as tofu boxes.
+# wget/ca-certificates also satisfy the HEALTHCHECK below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        fonts-padauk \
-        fonts-noto-core \
         fontconfig \
         libfontconfig1 \
+        fonts-dejavu-core \
+        wget \
+        ca-certificates \
+    && mkdir -p /usr/share/fonts/truetype/vedin \
+    # Padauk (primary Burmese face) — required.
+    && wget -q -O /usr/share/fonts/truetype/vedin/Padauk-Regular.ttf \
+         https://github.com/google/fonts/raw/main/ofl/padauk/Padauk-Regular.ttf \
+    && wget -q -O /usr/share/fonts/truetype/vedin/Padauk-Bold.ttf \
+         https://github.com/google/fonts/raw/main/ofl/padauk/Padauk-Bold.ttf \
+    # Noto Sans Myanmar (fallback) — best-effort: if the fetch fails, drop the partial
+    # file and carry on; Padauk already covers Burmese, so the build must not break.
+    && ( wget -q -O /usr/share/fonts/truetype/vedin/NotoSansMyanmar-Regular.ttf \
+           https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoSansMyanmar/hinted/ttf/NotoSansMyanmar-Regular.ttf \
+         || rm -f /usr/share/fonts/truetype/vedin/NotoSansMyanmar-Regular.ttf ) \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 
