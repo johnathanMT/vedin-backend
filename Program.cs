@@ -108,6 +108,7 @@ builder.Services.AddScoped<ChartAnalysisStep>();
 builder.Services.AddScoped<LifeAreaDraftStep>();
 builder.Services.AddScoped<SynthesisStep>();
 builder.Services.AddScoped<LanguagePolishStep>();
+builder.Services.AddScoped<GroundingCheckStep>();
 builder.Services.AddScoped<IAiReadingService, ReadingPipeline>();
 
 // Reading generation runs off the request path: approving a request enqueues it and

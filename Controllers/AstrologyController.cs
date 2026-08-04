@@ -94,6 +94,18 @@ public class AstrologyController : ControllerBase
             $"{req.Year:0000}-{req.Month:00}-{req.Day:00}T{req.Hour:00}:{req.Minute:00}:{req.Second:00}|" +
             $"{req.TimeZone}|{req.Latitude:F5}|{req.Longitude:F5}|{req.Ayanamsa?.ToLowerInvariant()}";
 
+        // The chart is a pure function of its inputs, so the cache key doubles as a
+        // strong validator (ETag). A client that already holds this exact chart and
+        // sends If-None-Match gets a 304 with an empty body — zero recompute, zero
+        // payload. (Browsers don't auto-condition POSTs, so this benefits API/CDN/
+        // conditional clients; same-session repeats are already served from cache.)
+        var etag = "\"" + System.Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(cacheKey)))[..16] + "\"";
+        if (string.Equals(Request.Headers.IfNoneMatch.ToString(), etag, StringComparison.Ordinal))
+            return StatusCode(StatusCodes.Status304NotModified);
+        Response.Headers.ETag = etag;
+        Response.Headers.CacheControl = "private, max-age=0, must-revalidate";
+
         var result = await _cache.GetAsync(cacheKey, ct);
         if (result is null)
         {

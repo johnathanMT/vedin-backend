@@ -37,12 +37,15 @@ public sealed class ReadingPipeline : IAiReadingService
         LifeAreaDraftStep areas,
         SynthesisStep synthesis,
         LanguagePolishStep polish,
+        GroundingCheckStep grounding,
         IChatModel model,
         AppDbContext db,
         IConfiguration cfg,
         ILogger<ReadingPipeline> log)
     {
-        _steps = new IReadingStep[] { analysis, areas, synthesis, polish };
+        // Grounding runs LAST: it verifies the finished, language-polished prose against
+        // the computed placements and is best-effort (never discards a good reading).
+        _steps = new IReadingStep[] { analysis, areas, synthesis, polish, grounding };
         _model = model;
         _db = db;
         _log = log;
@@ -87,7 +90,10 @@ public sealed class ReadingPipeline : IAiReadingService
                 requestId, step.Id, stepWatch.ElapsedMilliseconds, result.Data!.Length);
         }
 
-        var markdown = ctx.Get(LanguagePolishStep.StepId);
+        // Prefer the grounded text; fall back through polish → synthesis if grounding
+        // was skipped or an earlier resume left it absent.
+        var markdown = ctx.Get(GroundingCheckStep.StepId);
+        if (string.IsNullOrWhiteSpace(markdown)) markdown = ctx.Get(LanguagePolishStep.StepId);
         if (string.IsNullOrWhiteSpace(markdown)) markdown = ctx.Get(SynthesisStep.StepId);
         if (string.IsNullOrWhiteSpace(markdown))
             return ApiResponse<AiReadingResponseDto>.Fail("The pipeline produced an empty reading.", 502);
