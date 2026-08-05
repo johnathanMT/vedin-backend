@@ -83,19 +83,6 @@ public class ReadingStatusView
     public string? ApprovedAt { get; set; }
 }
 
-/// <summary>A querent's follow-up question about their already-prepared reading.</summary>
-public class ReadingAskDto
-{
-    [Required, MaxLength(500)]
-    public string Question { get; set; } = string.Empty;
-}
-
-/// <summary>The grounded answer to a follow-up question.</summary>
-public class ReadingAnswerDto
-{
-    public string Answer { get; set; } = string.Empty;
-}
-
 /// <summary>Admin listing row for pending/approved reading requests. When the
 /// request came from a signed-in account, the account's decrypted natal profile
 /// is attached so the Sayar has full context.</summary>

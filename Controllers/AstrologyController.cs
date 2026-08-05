@@ -33,13 +33,12 @@ public class AstrologyController : ControllerBase
     private readonly IEmailService _email;
     private readonly IConfiguration _cfg;
     private readonly IAiReadingService _ai;
-    private readonly IChatModel _model;
     private readonly IChartCache _cache;
     private readonly IReadingJobQueue _jobs;
     private readonly IReadingPdfService _pdf;
     private readonly string _encKey;
 
-    public AstrologyController(IAstrologyService service, AppDbContext db, IEmailService email, IConfiguration cfg, IAiReadingService ai, IChatModel model, IChartCache cache, IReadingJobQueue jobs, IReadingPdfService pdf)
+    public AstrologyController(IAstrologyService service, AppDbContext db, IEmailService email, IConfiguration cfg, IAiReadingService ai, IChartCache cache, IReadingJobQueue jobs, IReadingPdfService pdf)
     {
         _pdf = pdf;
         _service = service;
@@ -47,7 +46,6 @@ public class AstrologyController : ControllerBase
         _email = email;
         _cfg = cfg;
         _ai = ai;
-        _model = model;
         _cache = cache;
         _jobs = jobs;
         // Dedicated key preferred; falls back to the JWT key so it works out of the box.
@@ -644,58 +642,6 @@ public class AstrologyController : ControllerBase
     }
 
     // ═════════════════════════════════════════════════════════════════════════════
-    //  GROUNDED CONVERSATIONAL FOLLOW-UP  (Task 6)
-    //  The querent asks a question about THEIR finished reading; the model may use
-    //  ONLY the computed chart facts + the reading text, and declines anything else.
-    // ═════════════════════════════════════════════════════════════════════════════
-
-    /// <summary>Answer a follow-up question strictly grounded in the querent's own reading.</summary>
-    [HttpPost("reading/{id:int}/ask")]
-    [Authorize]
-    [EnableRateLimiting("ai")]
-    [ProducesResponseType(typeof(ApiResponse<ReadingAnswerDto>), StatusCodes.Status200OK)]
-    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> AskReading(int id, [FromBody] ReadingAskDto dto, CancellationToken ct)
-    {
-        if (!TryCustomerId(out int cid))
-            return Unauthorized(ApiResponse<object>.Fail("Not a customer token.", 401));
-        if (!ModelState.IsValid || string.IsNullOrWhiteSpace(dto?.Question))
-            return BadRequest(ApiResponse<object>.Fail("A question is required.", 400));
-
-        var (row, chart, markdown) = await LoadOwnedReadingAsync(id, cid, ct);
-        if (row is null) return NotFound(ApiResponse<object>.Fail("Reading not found.", 404));
-
-        var burmese = chart is null || !string.Equals(chart.Language, "en", StringComparison.OrdinalIgnoreCase);
-        var facts = chart is null ? "(chart facts unavailable)" : new ReadingContext { Chart = chart }.ChartFacts();
-
-        // The question leads, so the model answers THAT rather than summarising the reading;
-        // the chart facts + reading follow as the only source of truth.
-        var user =
-$"""
-=== THE QUERENT'S QUESTION (answer THIS, specifically and completely) ===
-{dto!.Question.Trim()}
-
-Use ONLY the following as your source of truth. Pull in a placement or dasha only when it
-directly helps answer the question above.
-
-{facts}
-
-=== THE READING ALREADY PREPARED FOR THE QUERENT ===
-{markdown}
-""";
-
-        // 2000 tokens: a Burmese sentence spends far more tokens per character than English, so a
-        // lower cap was cutting answers off mid-sentence. Temperature 0.3 keeps a warm, natural tone.
-        var result = await _model.CompleteAsync(AskSystem(burmese), user,
-            new ChatOptions { Temperature = 0.3, MaxOutputTokens = 2000 }, ct);
-
-        if (!result.Success || string.IsNullOrWhiteSpace(result.Data))
-            return StatusCode(result.StatusCode, ApiResponse<object>.Fail(result.Message, result.StatusCode));
-
-        return Ok(ApiResponse<ReadingAnswerDto>.Ok(new ReadingAnswerDto { Answer = result.Data!.Trim() }, "OK"));
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════════
     //  STREAMING READING  (Task 7) — Server-Sent Events
     //  The reading is already generated AND grounding-checked, so this streams the
     //  STORED text token-by-token rather than re-invoking the model: re-running the
@@ -773,34 +719,6 @@ directly helps answer the question above.
         }
         if (sb.Length > 0) yield return sb.ToString();
     }
-
-    /// <summary>System prompt for a grounded follow-up: chart + reading are the only
-    /// admissible facts, and anything outside that scope is politely declined.</summary>
-    private static string AskSystem(bool burmese) =>
-$"""
-You are the astrologer's warm, friendly assistant. The querent has ALREADY received a full Vedic
-reading and now asks ONE specific follow-up question. Your only job is to answer THAT question
-directly, naturally, and completely. Rules you must never break:
-
-1. Answer the querent's specific question directly. If they ask about love or relationships,
-   answer about love; if about career, answer about career. Do NOT pivot to an unrelated topic —
-   for example, never answer a love question with dasha or money analysis — unless that detail is
-   genuinely needed to explain the answer to THIS question.
-2. Ground every point ONLY in the CHART SNAPSHOT facts and the READING text provided. Do not
-   invent placements, dashas, dates, yogas, or predictions that are not present in them. Bring in a
-   placement, house, or dasha ONLY when it directly supports your answer to this question.
-3. Do NOT include structural headers, scaffolding, or labels of any kind. Never write
-   "Paragraph 1:", "Paragraph X:", "Section", "Dasha Connection", or similar. Never emit raw
-   markdown tags such as #, ##, ###, *, or **. Write plain, flowing sentences only.
-4. If the question is outside the scope of this chart or reading — about other people, general
-   knowledge, or medical, legal, or financial decisions, or details the chart does not contain —
-   politely decline in a sentence or two and suggest two or three relevant questions the querent
-   COULD ask about their own chart.
-5. Write a COMPLETE answer of two to four short paragraphs and FINISH every sentence — never stop
-   mid-sentence or mid-thought. Keep it focused enough to finish naturally within the space.
-6. Write your entire answer in {(burmese ? "natural, polite, conversational Burmese (မြန်မာဘာသာဖြင့်သာ)" : "English")},
-   in a warm, friendly tone, as if speaking directly to the querent.
-""";
 
     // ── Admin: list reading requests (optionally filter by status) ──────────────
     [HttpGet("admin/reading-requests")]
