@@ -82,7 +82,7 @@ ABSOLUTE RULES
         var sb = new StringBuilder();
         foreach (var area in ReadingContext.Areas)
         {
-            sb.AppendLine($"#### {(ctx.Burmese ? area.TitleMm : area.TitleEn)}");
+            sb.AppendLine($"#### {ctx.AreaTitle(area)}");
             sb.AppendLine();
             sb.AppendLine(drafts[area.Id].Trim());
             sb.AppendLine();
@@ -94,11 +94,7 @@ ABSOLUTE RULES
     private async Task<ApiResponse<string>> DraftAreaAsync(
         ReadingContext ctx, LifeArea area, string analysis, CancellationToken ct)
     {
-        var language = ctx.Burmese
-            ? "Write in 100% fluent, natural Burmese (မြန်မာ). No English sentences. The only "
-            + "permitted foreign words are established Vedic terms in Burmese transliteration "
-            + "(ဒသာ, အန္တရ်ဒသာ, အဋ္ဌကဝဂ်, ဆဒ္ဗလ, လဂ်နာ)."
-            : "Write in clear, warm English.";
+        var language = ctx.LanguageDirective();
 
         var user =
 $"""

@@ -4,7 +4,7 @@ using PortfolioApi.DTOs.Astrology;
 namespace PortfolioApi.Services.Ai;
 
 /// <summary>The seven life areas the reading covers, in presentation order.</summary>
-public sealed record LifeArea(string Id, string TitleMm, string TitleEn, string Focus);
+public sealed record LifeArea(string Id, string TitleMm, string TitleEn, string TitleJa, string Focus);
 
 /// <summary>
 /// Everything a step needs: the computed chart, the language, and whatever earlier
@@ -18,7 +18,55 @@ public sealed class ReadingContext
     /// <summary>Reading request row id, when the run is resumable. Null for one-off runs.</summary>
     public int? RequestId { get; init; }
 
-    public bool Burmese => !string.Equals(Chart.Language, "en", StringComparison.OrdinalIgnoreCase);
+    /// <summary>Normalised reading language: "my" (Burmese, default), "en", or "ja".</summary>
+    public string Lang
+    {
+        get
+        {
+            var raw = (Chart.Language ?? "my").Trim().ToLowerInvariant();
+            return raw is "en" or "english" ? "en"
+                 : raw is "ja" or "jp" or "japanese" ? "ja"
+                 : "my";
+        }
+    }
+
+    public bool Burmese => Lang == "my";
+    public bool Japanese => Lang == "ja";
+    public bool English => Lang == "en";
+
+    /// <summary>The life-area heading in the reading's language.</summary>
+    public string AreaTitle(LifeArea a) => Japanese ? a.TitleJa : Burmese ? a.TitleMm : a.TitleEn;
+
+    /// <summary>
+    /// The strict, per-language writing instruction injected into every client-facing
+    /// drafting/synthesis step, so the whole reading is produced natively in the chosen
+    /// language rather than translated after the fact.
+    /// </summary>
+    public string LanguageDirective() => Lang switch
+    {
+        "ja" =>
+"""
+You MUST write the ENTIRE response in Japanese. Use highly professional, polite, and empathetic
+business-level Japanese — proper 敬語 (Keigo) and 丁寧語 (Teineigo) throughout — as a master Vedic
+astrologer (インド占星術師) addressing a valued client. Do NOT write any sentence in English or
+Burmese. Use correct Japanese astrological terminology: ダシャー (Dasha), アンタルダシャー
+(Antardasha), ハウス (house), 惑星 (planet), 星座 (zodiac sign), ラグナ (Lagna / ascendant),
+ナクシャトラ (Nakshatra), アシュタカヴァルガ (Ashtakavarga), シャドバラ (Shadbala). Format with
+clear "### " headings and well-spaced "- " bullet points.
+""",
+        "en" =>
+"""
+Write the ENTIRE response in professional, premium English — the warm, polished register of an
+expert astrologer writing for a discerning client. Keep established Sanskrit/Vedic terms
+(Dasha, Lagna, Nakshatra) as-is. Use clear "### " headings and "- " bullet points.
+""",
+        _ =>
+"""
+Write every word in 100% fluent, natural, respectful Burmese (မြန်မာ). No English sentences. The
+only permitted foreign words are established Vedic terms in Burmese transliteration (ဒသာ,
+အန္တရ်ဒသာ, အဋ္ဌကဝဂ်, ဆဒ္ဗလ, လဂ်နာ). Use clear "### " headings and "- " bullet points.
+""",
+    };
 
     /// <summary>Completed step outputs, keyed by step id — including any restored from a
     /// previous partial run.</summary>
@@ -29,19 +77,19 @@ public sealed class ReadingContext
     /// <summary>The seven areas, with the houses/planets each one must stay anchored to.</summary>
     public static readonly IReadOnlyList<LifeArea> Areas = new List<LifeArea>
     {
-        new("education", "ပညာရေးနှင့် ဉာဏ်ရည်", "Education & intellect",
+        new("education", "ပညာရေးနှင့် ဉာဏ်ရည်", "Education & intellect", "教育と知性",
             "the 4th and 5th houses, Mercury, and Jupiter"),
-        new("career", "အလုပ်အကိုင်နှင့် စီးပွားရေး", "Career & livelihood",
+        new("career", "အလုပ်အကိုင်နှင့် စီးပွားရေး", "Career & livelihood", "仕事と天職",
             "the 10th (karma), 2nd (dhana) and 11th (gains) houses and their lords"),
-        new("wealth", "ငွေကြေးနှင့် ဓနဥစ္စာ", "Wealth & money",
+        new("wealth", "ငွေကြေးနှင့် ဓနဥစ္စာ", "Wealth & money", "財運と資産",
             "the 2nd and 11th houses plus the Sarvashtakavarga scores of the relevant signs"),
-        new("marriage", "အချစ်ရေးနှင့် အိမ်ထောင်ရေး", "Love & marriage",
+        new("marriage", "အချစ်ရေးနှင့် အိမ်ထောင်ရေး", "Love & marriage", "恋愛と結婚",
             "the 7th house, its lord, and Venus"),
-        new("health", "ကျန်းမာရေး", "Health & vitality",
+        new("health", "ကျန်းမာရေး", "Health & vitality", "健康と活力",
             "the 6th house, the Ascendant lord, and the Sun"),
-        new("society", "လူမှုဆက်ဆံရေးနှင့် ပတ်ဝန်းကျင်", "Community & relationships",
+        new("society", "လူမှုဆက်ဆံရေးနှင့် ပတ်ဝန်းကျင်", "Community & relationships", "人間関係と社会",
             "the 3rd and 11th houses and Mars"),
-        new("dharma", "ကံတရားနှင့် ဘာသာရေး", "Dharma & fortune",
+        new("dharma", "ကံတရားနှင့် ဘာသာရေး", "Dharma & fortune", "天命と幸運",
             "the 9th house, its lord, and Jupiter"),
     };
 

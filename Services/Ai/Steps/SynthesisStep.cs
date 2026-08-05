@@ -45,9 +45,15 @@ ABSOLUTE RULES
 
     public async Task<ApiResponse<string>> RunAsync(ReadingContext ctx, CancellationToken ct = default)
     {
-        var mm = ctx.Burmese;
-
-        var headings = mm
+        var headings = ctx.Japanese
+            ? new[]
+            {
+                "### 1. はじめに — 相談者の本質",
+                "### 2. 人生の七領域の詳細な鑑定",
+                "### 3. 現在進行中のダシャー期の考察",
+                "### 4. 対策(ヤントラ)と助言",
+            }
+            : ctx.Burmese
             ? new[]
             {
                 "### ၁။ နိဒါန်းနှင့် ဇာတာရှင်၏ အခြေခံ သဘာဝ",
@@ -63,11 +69,7 @@ ABSOLUTE RULES
                 "### 4. Remedies and guidance",
             };
 
-        var language = mm
-            ? "Write every word you add in 100% fluent, natural Burmese (မြန်မာ). No English "
-            + "sentences. The only permitted foreign words are established Vedic terms in Burmese "
-            + "transliteration (ဒသာ, အန္တရ်ဒသာ, အဋ္ဌကဝဂ်, ဆဒ္ဗလ, လဂ်နာ)."
-            : "Write in clear, warm English.";
+        var language = ctx.LanguageDirective();
 
         var user =
 $"""
