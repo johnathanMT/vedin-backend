@@ -668,19 +668,26 @@ public class AstrologyController : ControllerBase
         var burmese = chart is null || !string.Equals(chart.Language, "en", StringComparison.OrdinalIgnoreCase);
         var facts = chart is null ? "(chart facts unavailable)" : new ReadingContext { Chart = chart }.ChartFacts();
 
+        // The question leads, so the model answers THAT rather than summarising the reading;
+        // the chart facts + reading follow as the only source of truth.
         var user =
 $"""
+=== THE QUERENT'S QUESTION (answer THIS, specifically and completely) ===
+{dto!.Question.Trim()}
+
+Use ONLY the following as your source of truth. Pull in a placement or dasha only when it
+directly helps answer the question above.
+
 {facts}
 
 === THE READING ALREADY PREPARED FOR THE QUERENT ===
 {markdown}
-
-=== THE QUERENT'S FOLLOW-UP QUESTION ===
-{dto!.Question.Trim()}
 """;
 
+        // 2000 tokens: a Burmese sentence spends far more tokens per character than English, so a
+        // lower cap was cutting answers off mid-sentence. Temperature 0.3 keeps a warm, natural tone.
         var result = await _model.CompleteAsync(AskSystem(burmese), user,
-            new ChatOptions { Temperature = 0.2, MaxOutputTokens = 1200 }, ct);
+            new ChatOptions { Temperature = 0.3, MaxOutputTokens = 2000 }, ct);
 
         if (!result.Success || string.IsNullOrWhiteSpace(result.Data))
             return StatusCode(result.StatusCode, ApiResponse<object>.Fail(result.Message, result.StatusCode));
@@ -771,21 +778,28 @@ $"""
     /// admissible facts, and anything outside that scope is politely declined.</summary>
     private static string AskSystem(bool burmese) =>
 $"""
-You are the astrologer's assistant, answering a querent's follow-up question about a Vedic
-reading that has ALREADY been prepared for them. Rules you must never break:
+You are the astrologer's warm, friendly assistant. The querent has ALREADY received a full Vedic
+reading and now asks ONE specific follow-up question. Your only job is to answer THAT question
+directly, naturally, and completely. Rules you must never break:
 
-1. Answer using ONLY the CHART SNAPSHOT facts and the READING text provided below. These are
-   the only admissible facts. Do not compute or assume any placement, dasha, date, yoga, or
-   prediction that is not present in them.
-2. When you make a point, anchor it to the specific placement, house, dasha, or reading
-   section that supports it, so the querent can see where the answer comes from.
-3. If the question falls outside the scope of this chart or reading — about other people,
-   general knowledge, or medical, legal, or financial decisions, or details the chart simply
-   does not contain — politely decline in a sentence or two and suggest two or three relevant
-   questions the querent COULD ask about their own chart (a specific house, a dasha period, or
-   one of the life areas the reading covers).
-4. Be warm, concise, and specific. A few short paragraphs at most.
-5. Write your entire answer in {(burmese ? "Burmese (မြန်မာဘာသာဖြင့်သာ)" : "English")}.
+1. Answer the querent's specific question directly. If they ask about love or relationships,
+   answer about love; if about career, answer about career. Do NOT pivot to an unrelated topic —
+   for example, never answer a love question with dasha or money analysis — unless that detail is
+   genuinely needed to explain the answer to THIS question.
+2. Ground every point ONLY in the CHART SNAPSHOT facts and the READING text provided. Do not
+   invent placements, dashas, dates, yogas, or predictions that are not present in them. Bring in a
+   placement, house, or dasha ONLY when it directly supports your answer to this question.
+3. Do NOT include structural headers, scaffolding, or labels of any kind. Never write
+   "Paragraph 1:", "Paragraph X:", "Section", "Dasha Connection", or similar. Never emit raw
+   markdown tags such as #, ##, ###, *, or **. Write plain, flowing sentences only.
+4. If the question is outside the scope of this chart or reading — about other people, general
+   knowledge, or medical, legal, or financial decisions, or details the chart does not contain —
+   politely decline in a sentence or two and suggest two or three relevant questions the querent
+   COULD ask about their own chart.
+5. Write a COMPLETE answer of two to four short paragraphs and FINISH every sentence — never stop
+   mid-sentence or mid-thought. Keep it focused enough to finish naturally within the space.
+6. Write your entire answer in {(burmese ? "natural, polite, conversational Burmese (မြန်မာဘာသာဖြင့်သာ)" : "English")},
+   in a warm, friendly tone, as if speaking directly to the querent.
 """;
 
     // ── Admin: list reading requests (optionally filter by status) ──────────────
